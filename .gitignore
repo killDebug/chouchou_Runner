@@ -1,0 +1,8 @@
+.pio
+.pioenvs
+.vscode/settings.json
+.idea
+*.swp
+*.swo
+*~
+.DS_Store

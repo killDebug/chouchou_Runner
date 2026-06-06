@@ -1,0 +1,6 @@
+.pio
+.vscode/settings.json
+.idea
+*.swp
+*.swo
+*~
