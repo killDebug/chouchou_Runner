@@ -327,6 +327,12 @@ void GameManager::onButtonPress(char btn, unsigned long now, bool connReady, boo
     return;
   }
 
+  if (state_ == GameState::WIN || state_ == GameState::LOSE) {
+    resetToIdle();
+    syncTurnToIdle(switchAMacValid, switchBMacValid, sendToA, sendToB);
+    return;
+  }
+
   if (state_ != GameState::RUNNING) return;
 
   // 严格 A/B 交替：非期望按键忽略 + BAD 惩罚（灯环闪红 + 警告音）

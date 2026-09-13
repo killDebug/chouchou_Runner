@@ -150,6 +150,7 @@ volatile unsigned long gameOverShowTime = 0;
 volatile bool victoryShow = false;
 volatile unsigned long victoryShowTime = 0;
 #define VICTORY_SHOW_MS 4000          // 胜利全绿显示时长（与主控一致）
+volatile bool awaitRestartShow = false;  // 胜负展示后两端同白呼吸：按一下再来
 // 主控发 RDY：双开关就绪，B 显示彩色流水灯
 volatile bool hostReadyDisplay = false;
 // 主控发 TA/TB：轮到谁按（本开关为 B）
@@ -762,6 +763,7 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     victoryShow = false;
     hostReadyDisplay = false;
     myTurn = (hostColMeta & 1u) != 0;
+    awaitRestartShow = false;
     return;
   }
   // 游戏失败：主控发 GOF，灯环同步全红
@@ -771,6 +773,9 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     gameOverShowTime = millis();
     gameColorValid = false;
     hostReadyDisplay = false;
+    myTurn = false;
+    lastAckTime = 0;
+    awaitRestartShow = true;
     return;
   }
   // 本波全部消除胜利：主控发 WIN，灯环同步全绿
@@ -781,6 +786,9 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     gameColorValid = false;
     gameOverShow = false;
     hostReadyDisplay = false;
+    myTurn = false;
+    lastAckTime = 0;
+    awaitRestartShow = true;
     return;
   }
 }
@@ -994,6 +1002,30 @@ void updateLedTest() {
     }
   }
 
+  // 胜负结果：两端同一套灯，必须压过 myTurn/RDY，否则收尾那只开关会白闪
+  if (gameOverShow) {
+    if ((now - gameOverShowTime) < GAME_OVER_SHOW_MS) {
+      fill_solid(leds, NUM_LEDS, CRGB::Red);
+      FastLED.show();
+      return;
+    }
+    gameOverShow = false;
+  }
+  if (victoryShow) {
+    if ((now - victoryShowTime) < VICTORY_SHOW_MS) {
+      fill_solid(leds, NUM_LEDS, CRGB::Green);
+      FastLED.show();
+      return;
+    }
+    victoryShow = false;
+  }
+  if (awaitRestartShow) {
+    uint8_t br = beatsin8(22, 70, 255);
+    fill_solid(leds, NUM_LEDS, CHSV(0, 0, br));
+    FastLED.show();
+    return;
+  }
+
   // 主控发 RDY：双开关就绪，B 显示彩色流水灯（与伴睡效果类似）
   if (hostReadyDisplay) {
     unsigned long t = millis();
@@ -1019,24 +1051,6 @@ void updateLedTest() {
     fill_solid(leds, NUM_LEDS, CRGB::Green);
     FastLED.show();
     return;
-  }
-  // 主控同步：游戏失败全红
-  if (gameOverShow) {
-    if ((now - gameOverShowTime) < GAME_OVER_SHOW_MS) {
-      fill_solid(leds, NUM_LEDS, CRGB::Red);
-      FastLED.show();
-      return;
-    }
-    gameOverShow = false;
-  }
-  // 主控同步：本波全部消除胜利，全绿
-  if (victoryShow) {
-    if ((now - victoryShowTime) < VICTORY_SHOW_MS) {
-      fill_solid(leds, NUM_LEDS, CRGB::Green);
-      FastLED.show();
-      return;
-    }
-    victoryShow = false;
   }
   if (hostAlignAlert && ledTestMode == LED_OFF) {
     static bool alignBlink = false;
