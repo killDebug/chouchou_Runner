@@ -2,7 +2,6 @@
 
 #include "game_types.h"
 #include "color_stream.h"
-#include "game_palette.h"
 #include <FastLED.h>
 #include <stdint.h>
 
@@ -24,12 +23,13 @@ class GameManager {
   int dotCount() const { return dotCount_; }
   char expectedButton() const { return expectedButton_; }
   uint32_t colorWaveIndex() const { return colors_.waveIndex(); }
-  uint8_t colorThemeIndex() const { return themeIndex_; }
   int pendingCatchUpCount() const { return pendingCount_; }
   unsigned long pauseStartedMs() const { return pauseStartedMs_; }
 
   /** 当前目标色：有积压=队头最旧（防守）；空=色流预告色（进攻，电脑下一拍跟同色） */
   uint8_t targetColorIndex() const;
+  /** 当前目标色相：防守取场上最旧电脑点，进攻取色流预告色 */
+  uint8_t targetHue() const;
 
   void resetToIdle();
   void startGame(unsigned long now, bool countAsFirstPress, bool switchAMacValid, bool switchBMacValid,
@@ -79,6 +79,7 @@ class GameManager {
   bool popPlayerLead(uint8_t& colorIndex, uint8_t& hue);
   uint8_t peekPlayerLead() const;
   uint8_t peekPlayerLeadHue() const;
+  void consumeColor();
 
   static constexpr int kMaxPending = 16;
   uint8_t pendingColors_[kMaxPending];
@@ -94,7 +95,6 @@ class GameManager {
   uint32_t nextDotId_ = 1;
   GameState state_ = GameState::IDLE;
   char expectedButton_ = 'A';
-  uint8_t themeIndex_ = 0;
   int numLeds_ = 460;
   int computerSpawnIntervalMs_ = 2000;
   int moveIntervalMs_ = 50;

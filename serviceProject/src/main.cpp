@@ -11,7 +11,6 @@
 #include <U8g2lib.h>
 #include <driver/gpio.h>
 #include "game/game_manager.h"
-#include "game/game_palette.h"
 
 // WS2812B配置
 #define LED_PIN 2          // ESP32-C3的GPIO2，可根据实际接线修改
@@ -451,7 +450,7 @@ static int oledBuildStatusLines(String* out, int maxOut) {
   if (currentMode == TEST_GAME) {
     GameState gs = g_game.state();
     push(String("Game:") + hostGameStateLabel(gs) + " D" + String(g_game.dotCount()) + " Q" + String(g_game.pendingCatchUpCount()) +
-         " C" + String(g_game.targetColorIndex()) + " " + kGameThemes[g_game.colorThemeIndex()].name);
+         " H" + String(g_game.targetHue()));
     if (gs == GameState::RUNNING) push(String("Next:") + String(g_game.expectedButton()));
   }
   push(String("LED:") + String(NUM_LEDS) + " L" + String(FastLED.getBrightness()));
@@ -997,7 +996,8 @@ void handleStatusPage() {
     GameState gs = g_game.state();
     page += "<p><b>游戏状态</b>：" + String(hostGameStateLabel(gs)) + "，<b>Dot</b>：" + String(g_game.dotCount()) +
             "，<b>波次</b>：" + String(g_game.colorWaveIndex()) +
-            "，<b>主题</b>：" + String(kGameThemes[g_game.colorThemeIndex()].name) +
+            "，<b>配色</b>：即时生成" +
+            "，<b>目标色相</b>：" + String(g_game.targetHue()) +
             "，<b>目标色</b>：" + String(g_game.targetColorIndex()) +
             "，<b>积压</b>：" + String(g_game.pendingCatchUpCount());
     if (gs == GameState::RUNNING) {
@@ -1340,7 +1340,7 @@ void loop() {
     GameState colGs = g_game.state();
     if (colGs == GameState::IDLE || colGs == GameState::RUNNING || colGs == GameState::PAUSE) {
       uint32_t sig = ((uint32_t)(uint8_t)colGs << 24) | ((uint32_t)(uint8_t)g_game.expectedButton() << 16) |
-                     (uint32_t)g_game.targetColorIndex();
+                     ((uint32_t)g_game.targetHue() << 8) | (uint32_t)g_game.targetColorIndex();
       if (sig != lastColSig || (currentTime - lastColSentMs) >= 2000UL) {
         lastColSig = sig;
         lastColSentMs = currentTime;
@@ -1602,8 +1602,8 @@ void sendToSwitchB(const uint8_t* data, size_t len) {
 
 /** COL 同步帧：'C','O','L' + H,S,V + meta（低 bit=该开关可按，高 4bit=GameState）。A/B 的 meta 不同 */
 void sendColToBothSwitches() {
-  // 目标色 = pending 队头最旧（防守）或色流下一个预告色（进攻），取基础色相下发给开关
-  uint8_t h = gameThemeHue(g_game.colorThemeIndex(), g_game.targetColorIndex());
+  // 目标色 = pending 队头最旧（防守）或色流下一个预告色（进攻），下发当场生成的色相
+  uint8_t h = g_game.targetHue();
   uint8_t s = 255, v = 255;
   uint8_t gs = (uint8_t)g_game.state();
   uint8_t metaA = (uint8_t)((gs << 4) | (g_game.expectedButton() == 'A' ? 1 : 0));

@@ -1,52 +1,77 @@
 #include "color_stream.h"
 #include <esp_random.h>
 
-static uint8_t gcdU8(uint8_t a, uint8_t b) {
-  while (b) {
-    uint8_t t = (uint8_t)(a % b);
-    a = b;
-    b = t;
-  }
-  return a;
+int ColorStream::hueDist(uint8_t a, uint8_t b) {
+  int d = (int)a - (int)b;
+  if (d < 0) d = -d;
+  if (d > 128) d = 256 - d;
+  return d;
 }
 
-void ColorStream::newSession(uint8_t paletteLen) {
-  if (paletteLen < 2) paletteLen = 2;
-  if (paletteLen > kMaxPalette) paletteLen = kMaxPalette;
-  paletteLen_ = paletteLen;
+int ColorStream::minDistToKnown(uint8_t hue, const uint8_t* avoidHues, int avoidCount) const {
+  int minDist = 256;
+  for (int i = 0; i < recentCount_; i++) {
+    int d = hueDist(hue, recentHues_[i]);
+    if (d < minDist) minDist = d;
+  }
+  if (avoidHues && avoidCount > 0) {
+    for (int i = 0; i < avoidCount; i++) {
+      int d = hueDist(hue, avoidHues[i]);
+      if (d < minDist) minDist = d;
+    }
+  }
+  return minDist;
+}
 
-  for (int i = 0; i < kMaxPalette; i++) perm_[i] = (uint8_t)i;
-  // Fisher–Yates 洗牌：每局颜色出现顺序不同
-  for (int i = paletteLen_ - 1; i > 0; i--) {
-    int j = (int)(esp_random() % (uint32_t)(i + 1));
-    uint8_t t = perm_[i];
-    perm_[i] = perm_[j];
-    perm_[j] = t;
+void ColorStream::pickNext(const uint8_t* avoidHues, int avoidCount) {
+  id_ = nextId_++;
+  uint8_t best = (uint8_t)(hue_ + 97);
+  int bestMin = -1;
+  const bool haveKnown = (recentCount_ > 0) || (avoidHues && avoidCount > 0);
+
+  if (!haveKnown) {
+    hue_ = (uint8_t)esp_random();
+  } else {
+    for (int attempt = 0; attempt < 28; attempt++) {
+      uint8_t cand = (uint8_t)esp_random();
+      int md = minDistToKnown(cand, avoidHues, avoidCount);
+      if (md > bestMin) {
+        bestMin = md;
+        best = cand;
+        if (md >= kMinHueSep) break;
+      }
+    }
+    if (bestMin < kMinHueSep) {
+      // 色环挤满时按与 256 互质的步长跳开，避免又回到刚用过的色
+      int jitter = (int)(esp_random() % 13) - 6;
+      best = (uint8_t)(hue_ + 97 + jitter);
+    }
+    hue_ = best;
   }
 
-  // 随机选一个与色数互质的步进：一局内能遍历到所有颜色
-  uint8_t coprime[kMaxPalette];
-  uint8_t n = 0;
-  for (uint8_t s = 1; s < paletteLen_; s++) {
-    if (gcdU8(s, paletteLen_) == 1) coprime[n++] = s;
+  if (recentCount_ < kRecentKeep) {
+    recentHues_[recentCount_++] = hue_;
+  } else {
+    for (int i = 1; i < kRecentKeep; i++) recentHues_[i - 1] = recentHues_[i];
+    recentHues_[kRecentKeep - 1] = hue_;
   }
-  step_ = n ? coprime[esp_random() % n] : 1;
-  offset_ = (uint8_t)(esp_random() % paletteLen_);
+}
+
+void ColorStream::newSession() {
+  nextId_ = 0;
   cursor_ = 0;
+  recentCount_ = 0;
+  hue_ = 0;
+  pickNext(nullptr, 0);
 }
 
-uint8_t ColorStream::colorAtWave(uint32_t w) const {
-  uint8_t slot = (uint8_t)((w * (uint32_t)step_ + (uint32_t)offset_) % (uint32_t)paletteLen_);
-  return perm_[slot];
+void ColorStream::advanceWave(const uint8_t* avoidHues, int avoidCount) {
+  cursor_++;
+  pickNext(avoidHues, avoidCount);
 }
-
-uint8_t ColorStream::currentColor() const { return colorAtWave(cursor_); }
 
 void ColorStream::debugUpcoming(uint8_t outColors[8], int& outLen, int maxLen) const {
   outLen = 0;
   if (!outColors || maxLen <= 0) return;
-  int n = maxLen < 8 ? maxLen : 8;
-  for (int i = 0; i < n; i++) {
-    outColors[outLen++] = colorAtWave(cursor_ + (uint32_t)i);
-  }
+  outColors[outLen++] = id_;
 }

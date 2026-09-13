@@ -1,7 +1,6 @@
 #include "game_manager.h"
 #include "collision_manager.h"
 #include <Arduino.h>
-#include <esp_random.h>
 #include <string.h>
 
 #define RDY_MSG "RDY"
@@ -22,6 +21,24 @@ void GameManager::fireEvent(GameEvent e) {
 uint8_t GameManager::targetColorIndex() const {
   if (pendingCount_ > 0) return peekPending();
   return colors_.currentColor();
+}
+
+uint8_t GameManager::targetHue() const {
+  if (pendingCount_ > 0) {
+    uint8_t hue = 0;
+    if (findOldestComputerHue(peekPending(), hue)) return hue;
+  }
+  return colors_.currentHue();
+}
+
+void GameManager::consumeColor() {
+  uint8_t avoid[kMaxDots];
+  int n = 0;
+  for (int i = 0; i < kMaxDots; i++) {
+    if (!dots_[i].active) continue;
+    avoid[n++] = dots_[i].hue;
+  }
+  colors_.advanceWave(avoid, n);
 }
 
 // ---------- pending FIFO：电脑已出、等玩家防守跟色的颜色队列 ----------
@@ -130,9 +147,7 @@ bool GameManager::addDot(int position, int direction, uint8_t colorIndex, int16_
       if (fixedHue >= 0) {
         dots_[i].hue = (uint8_t)fixedHue;
       } else {
-        int base = gameThemeHue(themeIndex_, colorIndex);
-        int jitter = (int)(esp_random() % 11) - 5;
-        dots_[i].hue = (uint8_t)((base + jitter + 256) & 0xFF);
+        dots_[i].hue = colors_.currentHue();
       }
       if (outHue) *outHue = dots_[i].hue;
       dots_[i].position = position;
@@ -199,9 +214,10 @@ void GameManager::tickRunning(unsigned long now, bool switchAMacValid, bool swit
       }
     } else if (!playerShotThisTick_) {
       uint8_t c = colors_.currentColor();
-      if (addDot(0, +1, c)) {
+      uint8_t h = colors_.currentHue();
+      if (addDot(0, +1, c, (int16_t)h)) {
         pushPending(c);
-        colors_.advanceWave();
+        consumeColor();
         lastComputerSpawnMs_ = now;
       }
     }
@@ -295,18 +311,17 @@ bool GameManager::allowSwitchDoubleTapReset() const {
 void GameManager::startGame(unsigned long now, bool countAsFirstPress, bool switchAMacValid, bool switchBMacValid,
                             void (*sendToA)(const uint8_t*, size_t), void (*sendToB)(const uint8_t*, size_t)) {
   (void)countAsFirstPress;
-  // 每局随机挑一套主题调色板，色流按主题色数洗牌
-  themeIndex_ = (uint8_t)(esp_random() % kNumGameThemes);
-  colors_.newSession(kGameThemes[themeIndex_].count);
+  colors_.newSession();
 
   state_ = GameState::RUNNING;
   clearDots();
   lastMoveMs_ = now;
   // 开局立刻出第一颗电脑点并入防守队列，避免「间隔未到、积压为空」时玩家被当成进攻乱发射
   uint8_t first = colors_.currentColor();
-  if (addDot(0, +1, first)) {
+  uint8_t firstHue = colors_.currentHue();
+  if (addDot(0, +1, first, (int16_t)firstHue)) {
     pushPending(first);
-    colors_.advanceWave();
+    consumeColor();
   }
   lastComputerSpawnMs_ = now;  // 下一颗仍按完整间隔
   // A 按下开局，按交替规则把回合交给 B
@@ -353,13 +368,14 @@ void GameManager::onButtonPress(char btn, unsigned long now, bool connReady, boo
   } else {
     if (playerLeadCount_ >= kMaxPending) return;
     c = colors_.currentColor();
+    hue = (int16_t)colors_.currentHue();
   }
   uint8_t spawnedHue = 0;
   if (!addDot(numLeds_ - 1, -1, c, hue, &spawnedHue)) return;
   if (defending) {
     popPending(c);
   } else {
-    colors_.advanceWave();
+    consumeColor();
     pushPlayerLead(c, spawnedHue);
   }
   playerShotThisTick_ = true;
