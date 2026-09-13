@@ -104,6 +104,24 @@ static const uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const char ACK_MSG[] = "ACK_A";
 #define COLOR_MSG_PREFIX_LEN 3  // "COL"
 
+// 主机 MAC 学习：从主机定向消息（ACK/RDY/TA/TB/BAD/WIN/GOF/COL）里记下源地址，
+// 之后按键/心跳改单播（驱动层有 ACK 重试，远强于广播），广播仅作兜底
+static uint8_t hostMac[6] = {0};
+static bool hostMacValid = false;
+static unsigned long lastHostPacketMs = 0;
+
+/** 主机定向消息特征；开关间的 A/B/PA/PB/RST/RST! 不算 */
+static bool payloadIsFromHost(const uint8_t* data, int len) {
+  if (!data || len < 2) return false;
+  if (len >= 5 && (memcmp(data, "ACK_A", 5) == 0 || memcmp(data, "ACK_B", 5) == 0)) return true;
+  if (len >= 3 && memcmp(data, "RDY", 3) == 0) return true;
+  if (len >= 2 && data[0] == 'T' && (data[1] == 'A' || data[1] == 'B')) return true;
+  if (len >= 3 && (memcmp(data, "BAD", 3) == 0 || memcmp(data, "WIN", 3) == 0 || memcmp(data, "GOF", 3) == 0 ||
+                   memcmp(data, "COL", 3) == 0))
+    return true;
+  return false;
+}
+
 unsigned long lastPressTime = 0;
 bool lastRawButton = true;     // 上次采样值
 bool lastStableButton = true;  // 防抖后的稳定值
@@ -126,17 +144,15 @@ volatile bool gameColorValid = false;   // 收到主控 COL 后为 true
 volatile uint8_t gameColorH = 0, gameColorS = 255, gameColorV = 255;
 // COL 第 7 字节：低 bit=本开关是否可按下，高 4bit=主机 GameState（与主机 packMeta 一致）
 volatile uint8_t hostColMeta = 0;
-// 主控同步：游戏失败全红、倒计时红黄绿
+// 主控同步：游戏失败全红
 volatile bool gameOverShow = false;
 volatile unsigned long gameOverShowTime = 0;
 #define GAME_OVER_SHOW_MS 8000         // 失败全红显示时长
-volatile bool countdownActive = false;
-volatile unsigned long countdownStartTime = 0;
-#define COUNTDOWN_DURATION_MS 3000    // 倒计时总时长 3 秒
 // 主控同步：本波全部消除胜利，灯环全绿
 volatile bool victoryShow = false;
 volatile unsigned long victoryShowTime = 0;
 #define VICTORY_SHOW_MS 4000          // 胜利全绿显示时长（与主控一致）
+volatile bool awaitRestartShow = false;  // 胜负展示后两端同白呼吸：按一下再来
 // 主控发 RDY：待机彩色流水灯（当前轮次不需要本开关点击）
 volatile bool hostReadyDisplay = false;
 // 主控发 TA/TB：轮到谁按（本开关为 A）
@@ -169,6 +185,23 @@ void saveCachedHostIp(const String& ip);
 void rebindNetworkServices();
 void pollHostAlignHealth(unsigned long now, bool force);
 void ensureMdnsReady(unsigned long now);
+void sendCommandEx(const char* cmd, int copies);
+void ensureHostPeer();
+
+/** 提升 ESP-NOW 链路质量（解决“稍远/轻微遮挡就丢包”）：关 STA 省电、发射功率拉满、
+ *  可选 802.11 LR 长距离协议。注意：LR 必须三端（主机+A+B）同时开启/关闭 */
+#define ENABLE_ESPNOW_LR 1
+static void boostRadioForEspNow() {
+  esp_wifi_set_ps(WIFI_PS_NONE);   // modem sleep 是 ESP-NOW 近距丢包主因之一
+  esp_wifi_set_max_tx_power(84);   // 上限由 IDF 按地区自动钳制
+#if ENABLE_ESPNOW_LR
+  wifi_interface_t ifx = wifiConnected ? WIFI_IF_STA : WIFI_IF_AP;
+  esp_wifi_set_protocol(ifx, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+  addLog("射频：已关省电+满功率+LR 长距离模式");
+#else
+  addLog("射频：已关省电+满功率");
+#endif
+}
 
 void setup() {
   Serial.begin(115200);
@@ -200,6 +233,7 @@ void setup() {
 
   setupWiFi();
   alignToHostApIfNeeded();
+  boostRadioForEspNow();
   setupOTA();
   setupEspNow();
 
@@ -455,6 +489,9 @@ static void markHostEspNowReachable() {
 void pollHostAlignHealth(unsigned long now, bool force) {
   if (otaInProgress) return;  // OTA 期间不执行阻塞 HTTP，避免拖慢上传
   if (!wifiConnected || wifiApMode) return;
+  // 游戏进行中（COL meta 高 4 位 gs==1）跳过阻塞 HTTP 轮询，降低按键延迟；
+  // 链路活性由 ESP-NOW 心跳/ACK 保证（markHostEspNowReachable）
+  if (gameColorValid && ((hostColMeta >> 4) & 0x0Fu) == 1u) return;
   if (!force && (now - hostAlignLastTryMs) < HOST_ALIGN_POLL_MS) return;
   hostAlignLastTryMs = now;
 
@@ -650,6 +687,7 @@ void handleStatusPage() {
   page += "<p><b>ESP-NOW</b>：" + String(espNowReady ? "已就绪" : "未就绪") + "，<b>信道</b>：" + String((int)espNowChannel) + "（当前 STA；同 WiFi 即与主机/B 一致）</p>";
   page += "<p><b>主机对齐健康</b>：" + String(hostAlignAlert ? "异常（红灯告警，短按可立即重试）" : "正常") + "，连续失败：" + String((int)hostAlignFailStreak) + "</p>";
   page += "<p><b>灯环</b>：" + String(NUM_LEDS) + " 颗，亮度 " + String(FastLED.getBrightness()) + "</p>";
+  page += "<p><b>按键</b>：短按=发送 A；450ms 内双击=RST（非对战状态重置）；长按 2 秒=RST!（任意状态强制重置游戏）。</p>";
   page += "<p><b>提示</b>：长按 5 秒进入模式选择（开发；正式为 30 秒），灯环黄后按 1/2/3/4 下，5 秒无操作确认：1=调试 2=重置WiFi 3=关机 4=夜间伴睡。不按或按 5 下以上则取消。</p>";
   if (nightCompanionMode) {
     page += "<p><b>夜间伴睡</b>：已开启（灯环彩色流水+呼吸）。再次进入模式选择按 4 下可关闭。</p>";
@@ -684,6 +722,12 @@ void handleLogPage() {
 void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   (void)mac;
   if (!data) return;
+  // 学习主机 MAC：主机定向消息的源地址，之后改单播提升可靠性
+  if (mac && payloadIsFromHost(data, len)) {
+    memcpy(hostMac, mac, 6);
+    hostMacValid = true;
+    lastHostPacketMs = millis();
+  }
   if (len >= 5 && memcmp(data, ACK_MSG, 5) == 0) {
     lastAckTime = millis();
     markHostEspNowReachable();
@@ -721,6 +765,7 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     myTurn = (hostColMeta & 1u) != 0;
     gameOverShow = false;
     victoryShow = false;
+    awaitRestartShow = false;
     return;
   }
   // 游戏失败：主控发 GOF，灯环同步全红
@@ -730,17 +775,9 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     gameOverShowTime = millis();
     gameColorValid = false;
     hostReadyDisplay = false;
-    countdownActive = false;
-    return;
-  }
-  // 倒计时开始：主控发 CD，灯环同步红→黄→绿 3 秒
-  if (len >= 2 && data[0] == 'C' && data[1] == 'D') {
-    markHostEspNowReachable();
-    countdownActive = true;
-    countdownStartTime = millis();
-    gameColorValid = false;
-    hostReadyDisplay = false;
-    gameOverShow = false;
+    myTurn = false;
+    lastAckTime = 0;
+    awaitRestartShow = true;
     return;
   }
   // 本波全部消除胜利：主控发 WIN，灯环同步全绿
@@ -751,7 +788,9 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     gameColorValid = false;
     hostReadyDisplay = false;
     gameOverShow = false;
-    countdownActive = false;
+    myTurn = false;
+    lastAckTime = 0;
+    awaitRestartShow = true;
     return;
   }
 }
@@ -788,18 +827,45 @@ void setupEspNow() {
   addLog(wifiConnected ? "ESP-NOW 已就绪（在线）" : "ESP-NOW 已就绪（离线 AP）");
 }
 
-void sendCommand(const char* cmd) {
+/** 确保主机单播 peer 存在（学到主机 MAC 后发送前调用；已存在时 IDF 返回 EXIST，忽略即可） */
+void ensureHostPeer() {
+  if (!hostMacValid) return;
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, hostMac, 6);
+  peer.channel = espNowPeerChannel;
+  peer.ifidx = espNowIfidx;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+}
+
+/**
+ * 发送命令。copies>1 用于按键/重置等关键消息（三连发抗丢包，主机有 250ms 去重）。
+ * 已学到主机 MAC 则单播（驱动层对单播有 ACK 重试，比广播可靠得多），否则退回广播。
+ */
+void sendCommandEx(const char* cmd, int copies) {
   if (!espNowReady) {
     addLog("ESP-NOW 未就绪，无法发送");
     return;
   }
   size_t len = strlen(cmd);
   if (len == 0 || len > 250) return;
-  esp_err_t r = esp_now_send(broadcastMac, (const uint8_t*)cmd, len);
-  if (strcmp(cmd, "PA") != 0) {
-    addLog("已发送: " + String(cmd) + (r == ESP_OK ? " [OK]" : " [FAIL]"));
+  if (copies < 1) copies = 1;
+  for (int i = 0; i < copies; i++) {
+    esp_err_t r;
+    if (hostMacValid) {
+      ensureHostPeer();
+      r = esp_now_send(hostMac, (const uint8_t*)cmd, len);
+    } else {
+      r = esp_now_send(broadcastMac, (const uint8_t*)cmd, len);
+    }
+    if (i == 0 && strcmp(cmd, "PA") != 0) {
+      addLog("已发送: " + String(cmd) + (r == ESP_OK ? " [OK]" : " [FAIL]"));
+    }
+    if (i < copies - 1) delay(30);
   }
 }
+
+void sendCommand(const char* cmd) { sendCommandEx(cmd, 1); }
 
 void printLedHelp() {
   Serial.println("--- 灯环测试（串口命令）---");
@@ -830,7 +896,14 @@ void handlePressEvent(unsigned long durationMs, unsigned long nowMs) {
   // 长按 30s 的松手在 loop 里已进入模式选择，这里不再处理
   if (durationMs >= MODE_SELECT_ENTER_MS) return;
 
-  // 正常使用：短按发送 "A"
+  // 长按 2~5 秒：强制重置游戏（RST!，主机任意状态都接受；对战卡死时的脱困手段）
+  if (durationMs >= MODE_SELECT_TAP_THRESHOLD_MS) {
+    sendCommandEx("RST!", 3);
+    addLog("长按 2s：已发送 RST! 强制重置");
+    return;
+  }
+
+  // 正常使用：短按发送 "A"（三连发抗丢包，主机去重）
   if (durationMs < MODE_SELECT_TAP_THRESHOLD_MS) {
     if (nowMs - lastPressTime >= DEBOUNCE_PRESS_MS) {
       lastPressTime = nowMs;
@@ -838,16 +911,14 @@ void handlePressEvent(unsigned long durationMs, unsigned long nowMs) {
         hostAlignForceRetry = true;
         addLog("按键触发：立即重试主机对齐");
       }
-      // 双击：发送 RST（任意时刻都可重开）
       static unsigned long lastTap = 0;
       if (lastTap && (nowMs - lastTap) < 450) {
-        sendCommand("RST");
+        sendCommandEx("RST", 3);
         lastTap = 0;
         return;
       }
       lastTap = nowMs;
-      // 简化规则：不再校验 myTurn，按下就把 A 发给主机，让主机根据 expectedButton 判定是否有效
-      sendCommand("A");
+      sendCommandEx("A", 3);
     }
   }
 }
@@ -896,7 +967,8 @@ void updateLedTest() {
     FastLED.show();
     return;
   }
-  // 主机 COL 同步：RUNNING 可按下=队头色呼吸；不可按/IDLE=彩虹锁定；PAUSE=琥珀呼吸
+  // 主机 COL 同步：RUNNING 轮到本开关=目标色呼吸（防守=积压队头色，进攻=预告色，主机算好下发）；
+  // 非本回合=暗红微光（不可按/快离开）；IDLE 可按=绿灯呼吸（按我开局），不可按=暗红；PAUSE=琥珀呼吸
   if (gameColorValid) {
     uint8_t gs = (hostColMeta >> 4) & 0x0Fu;
     bool canPress = (hostColMeta & 1u) != 0;
@@ -907,12 +979,8 @@ void updateLedTest() {
         FastLED.show();
         return;
       }
-      unsigned long t = millis();
-      uint8_t hueOffset = (t / 40) % 256;
-      fill_rainbow(leds, NUM_LEDS, hueOffset, 12);
-      uint8_t phase = (t / 24) % 256;
-      uint8_t breath = 80 + ((175 * (uint16_t)sin8(phase)) >> 8);
-      nscale8(leds, NUM_LEDS, breath);
+      // 非本回合：暗红微光，提示“不可按/快离开”
+      fill_solid(leds, NUM_LEDS, CHSV(0, 255, 35));
       FastLED.show();
       return;
     }
@@ -923,16 +991,42 @@ void updateLedTest() {
       return;
     }
     if (gs == 0) {
-      unsigned long t = millis();
-      uint8_t hueOffset = (t / 40) % 256;
-      fill_rainbow(leds, NUM_LEDS, hueOffset, 12);
-      uint8_t phase = (t / 24) % 256;
-      uint8_t breath = 80 + ((175 * (uint16_t)sin8(phase)) >> 8);
-      nscale8(leds, NUM_LEDS, breath);
+      if (canPress) {
+        // 待机：该你开局 — 绿色呼吸，和另一只暗红键一眼能分开
+        uint8_t br = beatsin8(28, 90, 255);
+        fill_solid(leds, NUM_LEDS, CHSV(HUE_GREEN, 255, br));
+        FastLED.show();
+        return;
+      }
+      fill_solid(leds, NUM_LEDS, CHSV(0, 255, 35));
       FastLED.show();
       return;
     }
   }
+  // 胜负结果：两端同一套灯，必须压过 myTurn/RDY，否则收尾那只开关会白闪
+  if (gameOverShow) {
+    if ((now - gameOverShowTime) < GAME_OVER_SHOW_MS) {
+      fill_solid(leds, NUM_LEDS, CRGB::Red);
+      FastLED.show();
+      return;
+    }
+    gameOverShow = false;
+  }
+  if (victoryShow) {
+    if ((now - victoryShowTime) < VICTORY_SHOW_MS) {
+      fill_solid(leds, NUM_LEDS, CRGB::Green);
+      FastLED.show();
+      return;
+    }
+    victoryShow = false;
+  }
+  if (awaitRestartShow) {
+    uint8_t br = beatsin8(22, 70, 255);
+    fill_solid(leds, NUM_LEDS, CHSV(0, 0, br));
+    FastLED.show();
+    return;
+  }
+
   // 主控发 RDY：当前不需要本开关点击，显示彩色流水灯
   if (hostReadyDisplay) {
     unsigned long t = millis();
@@ -945,45 +1039,19 @@ void updateLedTest() {
     return;
   }
 
+  // 轮到本开关但 COL 颜色尚未同步到：白色呼吸提示“该你按了”，避免灯环熄灭无反馈
+  if (myTurn) {
+    uint8_t br = beatsin8(28, 90, 255);
+    fill_solid(leds, NUM_LEDS, CHSV(0, 0, br));
+    FastLED.show();
+    return;
+  }
+
   // 收到主控 ACK_A 后，灯环显示“上线”（全绿约 2 秒）
   if (lastAckTime != 0 && (now - lastAckTime) < ONLINE_SHOW_MS) {
     fill_solid(leds, NUM_LEDS, CRGB::Green);
     FastLED.show();
     return;
-  }
-  // 主控同步：游戏失败全红
-  if (gameOverShow) {
-    if ((now - gameOverShowTime) < GAME_OVER_SHOW_MS) {
-      fill_solid(leds, NUM_LEDS, CRGB::Red);
-      FastLED.show();
-      return;
-    }
-    gameOverShow = false;
-  }
-  // 主控同步：本波全部消除胜利，全绿
-  if (victoryShow) {
-    if ((now - victoryShowTime) < VICTORY_SHOW_MS) {
-      fill_solid(leds, NUM_LEDS, CRGB::Green);
-      FastLED.show();
-      return;
-    }
-    victoryShow = false;
-  }
-  // 主控同步：倒计时红→黄→绿（与主控 3 秒一致）
-  if (countdownActive) {
-    unsigned long elapsed = now - countdownStartTime;
-    if (elapsed >= COUNTDOWN_DURATION_MS) {
-      countdownActive = false;
-    } else {
-      if (elapsed < 1000)
-        fill_solid(leds, NUM_LEDS, CRGB::Red);
-      else if (elapsed < 2000)
-        fill_solid(leds, NUM_LEDS, CRGB::Yellow);
-      else
-        fill_solid(leds, NUM_LEDS, CRGB::Green);
-      FastLED.show();
-      return;
-    }
   }
   if (hostAlignAlert && ledTestMode == LED_OFF) {
     static bool alignBlink = false;
@@ -1048,11 +1116,18 @@ void loop() {
   ensureMdnsReady(now);
   pollHostAlignHealth(now, hostAlignForceRetry);
   hostAlignForceRetry = false;
-  // 心跳：每 2 秒发一次 PA，维持主机在线检测
+  // 心跳：每 2 秒发一次 PA 维持在线检测（已学到主机 MAC 则单播）；
+  // 每 5 次或主机 12s 无任何消息时补一包广播兜底（主机 MAC 变化/丢单播时可自愈）
   static unsigned long lastHb = 0;
+  static uint32_t hbCount = 0;
   if (espNowReady && (now - lastHb) >= 2000) {
     lastHb = now;
+    hbCount++;
     sendCommand("PA");
+    bool hostStale = (lastHostPacketMs == 0) || (now - lastHostPacketMs > 12000UL);
+    if (!hostMacValid || hostStale || (hbCount % 5) == 0) {
+      esp_now_send(broadcastMac, (const uint8_t*)"PA", 2);
+    }
   }
 
   // 伴睡模式：20 分钟无按键视为已睡着，自动进入深度睡眠

@@ -25,6 +25,9 @@ const char* defaultSsid     = "CMCC-tpXT";
 const char* defaultPassword = "rw6s6we7";
 const char* hostname = "ESP32-C3-LED";
 
+// ESP-NOW 长距离模式开关：三端（主机+A+B）需同时开启/关闭；LR 提升约 10dB 链路预算
+#define ENABLE_ESPNOW_LR 1
+
 Preferences wifiPrefs;
 Preferences hostPrefs;
 WebServer configServer(80);
@@ -38,6 +41,7 @@ bool httpServerStarted = false;
 // ESP-NOW 接收（无线开关发来的命令，低延迟、无需路由器）
 #define ESP_NOW_CMD_MAX 32
 static char espNowCmdBuf[ESP_NOW_CMD_MAX];
+static uint8_t espNowCmdMac[6] = {0};  // 与缓冲内容对应的发送方 MAC（用于按键重发去重）
 static volatile bool espNowCmdPending = false;
 static volatile uint32_t espNowRecvCount = 0;  // 回调里收到的包数，用于判断主机是否真的收到（状态页显示）
 static uint8_t lastSenderMac[6] = {0};  // 最近一次发送者的 MAC，用于回传 ACK
@@ -132,15 +136,12 @@ volatile unsigned long lastReceivedFromB = 0;
 #define ACK_MSG "ACK_A"
 #define ACK_B_MSG "ACK_B"
 #define RDY_MSG "RDY"                 // 主机发 B：显示“就绪”彩色流水灯
-#define COLOR_MSG_PREFIX "COL"
 #define GOF_MSG "GOF"
-#define CD_MSG "CD"
+#define DUP_WINDOW_MS 250UL           // 同一发送方同内容在该窗口内只执行一次（按键三连发去重）
 uint8_t switchAMac[6] = {0};
 bool switchAMacValid = false;
 uint8_t switchBMac[6] = {0};
 bool switchBMacValid = false;
-unsigned long lastColorSendTime = 0;
-#define COLOR_SEND_INTERVAL_MS 100
 unsigned long lastAckToASent = 0;
 unsigned long lastRdyToBSent = 0;
 #define ACK_A_SEND_INTERVAL_MS 3000   // 仅 IDLE 就绪态定期发 ACK_A/RDY，避免对战时 ESP-NOW 刷屏
@@ -229,8 +230,12 @@ void loadHostConfig();
 void saveForceOfflineConfig(bool enabled);
 void sendToSwitchA(const uint8_t* data, size_t len);
 void sendToSwitchB(const uint8_t* data, size_t len);
+void sendColToBothSwitches();
+void sendCopiesTo(const uint8_t* mac, const uint8_t* data, size_t len, int copies);
+static void flushDelayedCopies(unsigned long now);
 static void bridgeSendA(const uint8_t* data, size_t len);
 static void bridgeSendB(const uint8_t* data, size_t len);
+void hostResetGame();
 void playStartupBeep();
 void buzzerSpeedFeedback();
 void setupOled();
@@ -266,6 +271,75 @@ void buzzerSpeedFeedback() {
   delay(165);
   noTone(BUZZER_PIN);
 #endif
+}
+
+// ---------- 游戏音效：无阻塞序列器（millis 时间轴驱动，避免 delay 阻断灯带刷新） ----------
+enum GameSound : uint8_t { SND_NONE = 0, SND_START, SND_SHOOT, SND_COLLISION, SND_BAD, SND_WIN, SND_LOSE };
+struct SoundStep {
+  uint16_t freq;  // Hz，0 = 静音段
+  uint16_t ms;
+};
+static const SoundStep kSndStart[] = {{523, 80}, {659, 80}, {784, 80}, {1047, 150}};       // C5→E5→G5→C6 上爬
+static const SoundStep kSndShoot[] = {{880, 30}, {1318, 40}};                              // A5→E6 短哔
+static const SoundStep kSndCollision[] = {{1568, 25}, {1047, 25}, {784, 30}};              // G6→C6→G5 下降
+static const SoundStep kSndBad[] = {{196, 100}, {0, 30}, {196, 100}};                      // G3 双响警告
+static const SoundStep kSndWin[] = {{784, 120}, {1047, 120}, {1318, 120}, {1568, 300}};    // 大三和弦号角
+static const SoundStep kSndLose[] = {{330, 150}, {311, 150}, {294, 150}, {262, 400}};      // 下沉沮丧音阶
+
+static const SoundStep* sndSteps = nullptr;
+static uint8_t sndStepCount = 0;
+static uint8_t sndStepIdx = 0;
+static unsigned long sndStepStartMs = 0;
+
+/** 播放一段音效（新音效直接覆盖当前）；实际发声由 loop 里的 buzzerUpdate() 推进 */
+static void playGameSound(GameSound id) {
+#if BUZZER_ENABLE
+  switch (id) {
+    case SND_START: sndSteps = kSndStart; sndStepCount = sizeof(kSndStart) / sizeof(SoundStep); break;
+    case SND_SHOOT: sndSteps = kSndShoot; sndStepCount = sizeof(kSndShoot) / sizeof(SoundStep); break;
+    case SND_COLLISION: sndSteps = kSndCollision; sndStepCount = sizeof(kSndCollision) / sizeof(SoundStep); break;
+    case SND_BAD: sndSteps = kSndBad; sndStepCount = sizeof(kSndBad) / sizeof(SoundStep); break;
+    case SND_WIN: sndSteps = kSndWin; sndStepCount = sizeof(kSndWin) / sizeof(SoundStep); break;
+    case SND_LOSE: sndSteps = kSndLose; sndStepCount = sizeof(kSndLose) / sizeof(SoundStep); break;
+    default: return;
+  }
+  sndStepIdx = 0;
+  sndStepStartMs = millis();
+  if (sndSteps[0].freq > 0) tone(BUZZER_PIN, sndSteps[0].freq, sndSteps[0].ms);
+  else noTone(BUZZER_PIN);
+#else
+  (void)id;
+#endif
+}
+
+/** loop 每轮调用：按毫秒推进音效序列；tone/noTone 均非阻塞 */
+static void buzzerUpdate() {
+#if BUZZER_ENABLE
+  if (!sndSteps || sndStepCount == 0) return;
+  if (millis() - sndStepStartMs < sndSteps[sndStepIdx].ms) return;
+  sndStepIdx++;
+  if (sndStepIdx >= sndStepCount) {
+    sndSteps = nullptr;
+    sndStepCount = 0;
+    noTone(BUZZER_PIN);
+    return;
+  }
+  sndStepStartMs = millis();
+  if (sndSteps[sndStepIdx].freq > 0) tone(BUZZER_PIN, sndSteps[sndStepIdx].freq, sndSteps[sndStepIdx].ms);
+  else noTone(BUZZER_PIN);
+#endif
+}
+
+/** GameManager 事件 → 音效（保持非阻塞，勿在此 delay） */
+static void onGameEvent(GameEvent ev) {
+  switch (ev) {
+    case GameEvent::START: playGameSound(SND_START); addLog("音效：开局上爬音阶"); break;
+    case GameEvent::SHOOT: playGameSound(SND_SHOOT); break;
+    case GameEvent::COLLISION: playGameSound(SND_COLLISION); break;
+    case GameEvent::BAD: playGameSound(SND_BAD); addLog("按错/未交替：BAD 警告音"); break;
+    case GameEvent::WIN: playGameSound(SND_WIN); break;
+    case GameEvent::LOSE: playGameSound(SND_LOSE); break;
+  }
 }
 
 static void syncSpawnIntervalFromSpeed() {
@@ -375,7 +449,8 @@ static int oledBuildStatusLines(String* out, int maxOut) {
   push(String("Key:") + (lastSwitchPressed == 0 ? "-" : lastSwitchPressed == 'A' ? "A" : "B"));
   if (currentMode == TEST_GAME) {
     GameState gs = g_game.state();
-    push(String("Game:") + hostGameStateLabel(gs) + " D" + String(g_game.dotCount()) + " Q" + String((int)g_game.queueSize()));
+    push(String("Game:") + hostGameStateLabel(gs) + " D" + String(g_game.dotCount()) + " Q" + String(g_game.pendingCatchUpCount()) +
+         " H" + String(g_game.targetHue()));
     if (gs == GameState::RUNNING) push(String("Next:") + String(g_game.expectedButton()));
   }
   push(String("LED:") + String(NUM_LEDS) + " L" + String(FastLED.getBrightness()));
@@ -506,6 +581,7 @@ void setup() {
   FastLED.clear();
   FastLED.show();
   g_game.configure(NUM_LEDS, computerSpawnIntervalMs, moveIntervalMs);
+  g_game.setEventCallback(onGameEvent);  // 游戏事件 → 蜂鸣器音效
   pinMode(FORCE_OFFLINE_SWITCH_GPIO, INPUT_PULLUP);
   pinMode(GAME_SPEED_UP_GPIO, INPUT_PULLUP);
   pinMode(GAME_SPEED_DOWN_GPIO, INPUT_PULLUP);
@@ -525,6 +601,18 @@ void setup() {
     delay(800);  // WiFi 稳定后再初始化 ESP-NOW
     espNowIfidx = wifiConnected ? WIFI_IF_STA : WIFI_IF_AP;
     espNowPeerChannel = wifiConnected ? 0 : 1;
+    // 提升 ESP-NOW 链路质量（解决“稍远/轻微遮挡就丢包”）：
+    // 1) 关 STA 省电——modem sleep 会让 ESP-NOW 收包大量丢失；2) 发射功率拉满；
+    // 3) 可选 802.11 LR 长距离协议（三端必须同时开启；与路由器 STA 可共存，若异常改为 0）
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(84);
+#if ENABLE_ESPNOW_LR
+    esp_wifi_set_protocol(espNowIfidx,
+                          (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+    addLog("ESP-NOW：已关省电+满功率+LR 长距离模式");
+#else
+    addLog("ESP-NOW：已关省电+满功率");
+#endif
     if (esp_now_init() == ESP_OK) {
       // 先添加广播 peer 再注册回调。STA 用 channel=0(当前信道)；离线 AP 用固定 channel=1
       static const uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -566,7 +654,7 @@ void setup() {
   Serial.println("输入 '1' - 全部点亮模式");
   Serial.println("输入 '2' - 逐个点亮模式");
   Serial.println("输入 '3' - 游戏模式（从A点向B点移动）");
-  Serial.println("无线开关A 发 A、开关B 发 B，主程序可区分");
+  Serial.println("无线开关A 发 A、开关B 发 B，主程序可区分；关键消息三连发+主机去重，COL 同步轮次与颜色");
   Serial.println("输入 'brightness <0-255>' - 设置亮度（例如: brightness 100）");
   Serial.println("输入 'status' - 查看当前状态");
   Serial.println("输入 'debug on/off/debug' - OLED 调试；GPIO7 长按2~5s 同效");
@@ -907,7 +995,11 @@ void handleStatusPage() {
   if (currentMode == TEST_GAME) {
     GameState gs = g_game.state();
     page += "<p><b>游戏状态</b>：" + String(hostGameStateLabel(gs)) + "，<b>Dot</b>：" + String(g_game.dotCount()) +
-            "，<b>队列</b>：" + String((int)g_game.queueSize());
+            "，<b>波次</b>：" + String(g_game.colorWaveIndex()) +
+            "，<b>配色</b>：即时生成" +
+            "，<b>目标色相</b>：" + String(g_game.targetHue()) +
+            "，<b>目标色</b>：" + String(g_game.targetColorIndex()) +
+            "，<b>积压</b>：" + String(g_game.pendingCatchUpCount());
     if (gs == GameState::RUNNING) {
       page += "，<b>下一次应按</b>：" + String(g_game.expectedButton());
     }
@@ -954,21 +1046,12 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   if (n > 0 && data) {
     memcpy(espNowCmdBuf, data, n);
     espNowCmdBuf[n] = '\0';
+    if (mac) memcpy(espNowCmdMac, mac, 6); else memset(espNowCmdMac, 0, 6);
     espNowCmdPending = true;
   }
 }
 
 void loop() {
-#if OLED_ENABLE
-  // 调试模式：OLED 仅日志，刷新更勤；否则约 5 秒刷一次摘要
-  static unsigned long lastOledMs = 0;
-  unsigned long oledPeriod = oledSerialMirrorMode ? 400UL : 1000UL;
-  if (oledOk && (millis() - lastOledMs >= oledPeriod)) {
-    lastOledMs = millis();
-    refreshOledScreen();
-  }
-#endif
-
   // 第一次进入loop时输出 - 使用简单ASCII确保输出
   static bool firstLoop = true;
   if (firstLoop) {
@@ -990,6 +1073,9 @@ void loop() {
   // 处理 OTA
   ArduinoOTA.handle();
 
+  // 蜂鸣器音效序列推进（无阻塞）
+  buzzerUpdate();
+
   // 配网/状态页（AP 或 STA 连上时）
   if (wifiApMode || wifiConnected) {
     configServer.handleClient();
@@ -999,13 +1085,15 @@ void loop() {
   handleSerialInput();
   
   unsigned long currentTime = millis();
+  flushDelayedCopies(currentTime);
 
-  // GPIO7：短按三连击→详细日志；按住 2s～5s 松开→OLED 调试；满 5s→强制离线重启
+  // GPIO7：双短按→SET 重置游戏；三连击→详细日志；按住 2s～5s→OLED 调试；满 5s→强制离线重启
   static bool forceRawPrev = false;
   static unsigned long forcePressStart = 0;
   static bool forceHandled = false;
   static unsigned long gpio7TapLastMs = 0;
   static uint8_t gpio7TapCount = 0;
+  static unsigned long gpio7SetArmMs = 0;
   bool forceRaw = (digitalRead(FORCE_OFFLINE_SWITCH_GPIO) == LOW);
   if (forceRaw && !forceRawPrev) {
     forcePressStart = currentTime;
@@ -1026,6 +1114,7 @@ void loop() {
       gpio7TapCount++;
       gpio7TapLastMs = currentTime;
       if (gpio7TapCount >= 3) {
+        gpio7SetArmMs = 0;
         gpio7TapCount = 0;
         verboseSwitchLog = !verboseSwitchLog;
         addLog(String("详细日志(ESP-NOW/识别/回传):") + (verboseSwitchLog ? "开" : "关"));
@@ -1035,6 +1124,8 @@ void loop() {
 #if OLED_ENABLE
         if (oledOk) refreshOledScreen();
 #endif
+      } else if (gpio7TapCount == 2) {
+        gpio7SetArmMs = currentTime;
       }
     } else if (dur >= OLED_DEBUG_HOLD_MIN_MS && dur < FORCE_OFFLINE_HOLD_MS && !forceHandled) {
       oledSerialMirrorMode = !oledSerialMirrorMode;
@@ -1049,6 +1140,13 @@ void loop() {
     forcePressStart = 0;
   }
   forceRawPrev = forceRaw;
+
+  // GPIO7 双短按 SET：0.9s 内无第 3 击则重置游戏（第 3 击留给详细日志）
+  if (gpio7SetArmMs != 0 && gpio7TapCount == 2 && (currentTime - gpio7SetArmMs) >= GPIO7_TAP_WINDOW_MS) {
+    hostResetGame();
+    gpio7TapCount = 0;
+    gpio7SetArmMs = 0;
+  }
 
   // GPIO8/9 调整游戏速度档位 1～30（每次 ±1；30 最快，1 最慢；默认 15）
   static bool upPrev = false;
@@ -1086,6 +1184,18 @@ void loop() {
     String cmd(espNowCmdBuf);
     cmd.trim();
     if (cmd.length() > 0) {
+      // 按键/心跳三连发去重：同一发送方+同一内容在 DUP_WINDOW_MS 内只执行一次
+      // （注意不能放在回调里：心跳/在线时间已在回调逐包刷新，这里只去重命令执行）
+      static uint8_t lastDupMac[6] = {0};
+      static char lastDupCmd[ESP_NOW_CMD_MAX] = {0};
+      static unsigned long lastDupMs = 0;
+      if (memcmp(espNowCmdMac, lastDupMac, 6) == 0 && strncmp(cmd.c_str(), lastDupCmd, ESP_NOW_CMD_MAX) == 0 &&
+          (currentTime - lastDupMs) < DUP_WINDOW_MS) {
+        // 只跳过这条重复命令，绝不能 return 整个 loop（否则 tick/刷灯被掐掉，灯带会停一拍再整条刷新）
+      } else {
+      strlcpy(lastDupCmd, cmd.c_str(), ESP_NOW_CMD_MAX);
+      memcpy(lastDupMac, espNowCmdMac, 6);
+      lastDupMs = currentTime;
       if (espNowDebug) {
         Serial.print("[ESP-NOW raw] len=");
         Serial.print((int)cmd.length());
@@ -1123,9 +1233,10 @@ void loop() {
         peer.ifidx = espNowIfidx;
         peer.encrypt = false;
         esp_err_t addRet = esp_now_add_peer(&peer);
-        // 心跳 PA 不回 ACK，减少对战时 ESP-NOW 拥塞；真实按键 A 才回 ACK
-        if (!isAHeartbeatOnly && (addRet == ESP_OK || addRet == ESP_ERR_ESPNOW_EXIST)) {
-          esp_now_send(lastSenderMac, (const uint8_t*)ACK_MSG, (sizeof(ACK_MSG) - 1));
+        // 心跳不回 ACK；对战中也不回（TA/COL 已够用），避免按一下就堵 25ms
+        if (!isAHeartbeatOnly && g_game.state() != GameState::RUNNING &&
+            (addRet == ESP_OK || addRet == ESP_ERR_ESPNOW_EXIST)) {
+          sendCopiesTo(lastSenderMac, (const uint8_t*)ACK_MSG, (sizeof(ACK_MSG) - 1), 2);
           if (verboseSwitchLog) Serial.println("已回传 ACK_A，开关A 灯环将显示上线");
           addLogVerbose("已回传 ACK_A，开关A 上线");
         }
@@ -1144,8 +1255,9 @@ void loop() {
         peer.ifidx = espNowIfidx;
         peer.encrypt = false;
         esp_err_t addRetB = esp_now_add_peer(&peer);
-        if (!isBHeartbeatOnly && (addRetB == ESP_OK || addRetB == ESP_ERR_ESPNOW_EXIST)) {
-          esp_now_send(lastSenderMac, (const uint8_t*)ACK_B_MSG, (sizeof(ACK_B_MSG) - 1));
+        if (!isBHeartbeatOnly && g_game.state() != GameState::RUNNING &&
+            (addRetB == ESP_OK || addRetB == ESP_ERR_ESPNOW_EXIST)) {
+          sendCopiesTo(lastSenderMac, (const uint8_t*)ACK_B_MSG, (sizeof(ACK_B_MSG) - 1), 2);
           if (verboseSwitchLog) Serial.println("已回传 ACK_B，开关B 灯环将显示上线");
           addLogVerbose("已回传 ACK_B，开关B 上线");
         }
@@ -1156,6 +1268,7 @@ void loop() {
       }
       // 最后再处理命令（依赖 A/B 在线状态时更准确）
       processCommand(cmd);
+      }
     }
   }
 
@@ -1216,6 +1329,26 @@ void loop() {
     }
   }
 
+  // 按键处理里可能排队了重发；取当前时间再 tick/刷灯，避免用循环开头的旧时间戳
+  currentTime = millis();
+
+  // COL 颜色同步：游戏状态/轮次/目标色任一变化立即下发；另有 2s 周期刷新兜底抗丢包。
+  // 事件驱动不再刷屏（旧版 100ms 轮询已废弃）；开关收到后按 meta 显示“该谁按+按什么色”
+  if (connectionState == CONN_READY && currentMode == TEST_GAME) {
+    static uint32_t lastColSig = 0xFFFFFFFF;
+    static unsigned long lastColSentMs = 0;
+    GameState colGs = g_game.state();
+    if (colGs == GameState::IDLE || colGs == GameState::RUNNING || colGs == GameState::PAUSE) {
+      uint32_t sig = ((uint32_t)(uint8_t)colGs << 24) | ((uint32_t)(uint8_t)g_game.expectedButton() << 16) |
+                     ((uint32_t)g_game.targetHue() << 8) | (uint32_t)g_game.targetColorIndex();
+      if (sig != lastColSig || (currentTime - lastColSentMs) >= 2000UL) {
+        lastColSig = sig;
+        lastColSentMs = currentTime;
+        sendColToBothSwitches();
+      }
+    }
+  }
+
   // 显示：搜索中=蓝呼吸，就绪未开始=彩色流水，就绪且游戏已开始=testGame
   if (connectionState == CONN_WAITING_A) {
     testWaitingForA();
@@ -1232,6 +1365,17 @@ void loop() {
     FastLED.show();
     lastUpdate = currentTime;
   }
+
+#if OLED_ENABLE
+  // OLED 放在刷灯之后：全缓冲 I2C 很慢，对战时拉长间隔，避免整条灯带像被刷新了一下
+  static unsigned long lastOledMs = 0;
+  unsigned long oledPeriod = oledSerialMirrorMode ? 400UL
+                                                  : (g_game.state() == GameState::RUNNING ? 2500UL : 1000UL);
+  if (oledOk && (millis() - lastOledMs >= oledPeriod)) {
+    lastOledMs = millis();
+    refreshOledScreen();
+  }
+#endif
 }
 
 void handleSerialInput() {
@@ -1269,20 +1413,29 @@ void processCommand(String cmd) {
     g_game.syncTurnToIdle(switchAMacValid, switchBMacValid, bridgeSendA, bridgeSendB);
     Serial.println("切换到：游戏模式（Dot 版）");
     printCurrentMode();
+  } else if (cmd == "set") {
+    hostResetGame();
+  } else if (cmd == "rst!") {
+    // 开关长按 2s 发来的强制重置：任何状态都接受（对战卡死时的脱困手段）
+    hostResetGame();
+    addLog("开关 RST!（长按）：游戏已强制重置");
   } else if (cmd == "rst") {
-    g_game.forceIdle();
-    g_game.syncTurnToIdle(switchAMacValid, switchBMacValid, bridgeSendA, bridgeSendB);
-    addLog("收到 RST：重开游戏");
+    if (currentMode == TEST_GAME && g_game.allowSwitchDoubleTapReset()) {
+      hostResetGame();
+      addLog("开关双击 RST：游戏已重置");
+    } else {
+      addLogVerbose("忽略 RST：对战进行中；结果出来后双击可重置，或主机 GPIO7 双短按 SET");
+    }
   } else if (cmd == "a") {
     lastSwitchPressed = 'A';
-    Serial.println("开关A 按下");
-    addLog("收到开关A 按下");
+    if (g_game.state() == GameState::RUNNING) addLogVerbose("收到开关A 按下");
+    else addLog("收到开关A 按下");
     g_game.onButtonPress('A', millis(), connectionState == CONN_READY, currentMode == TEST_GAME, switchAMacValid,
                          switchBMacValid, bridgeSendA, bridgeSendB);
   } else if (cmd == "b") {
     lastSwitchPressed = 'B';
-    Serial.println("开关B 按下");
-    addLog("收到开关B 按下");
+    if (g_game.state() == GameState::RUNNING) addLogVerbose("收到开关B 按下");
+    else addLog("收到开关B 按下");
     g_game.onButtonPress('B', millis(), connectionState == CONN_READY, currentMode == TEST_GAME, switchAMacValid,
                          switchBMacValid, bridgeSendA, bridgeSendB);
   } else if (cmd == "pa" || cmd == "pb") {
@@ -1421,7 +1574,7 @@ void testOneByOne() {
 
 // 旧颜色回传玩法已弃用（改为 Dot + 状态机玩法）
 
-// 向开关 A 发短消息（ACK_A、GOF、CD 等）
+// 向开关 A 发短消息（ACK_A、TA、RDY 等，内部双发抗丢包）
 void sendToSwitchA(const uint8_t* data, size_t len) {
   if (!switchAMacValid || !data || len == 0) return;
   esp_now_peer_info_t peer = {};
@@ -1431,10 +1584,10 @@ void sendToSwitchA(const uint8_t* data, size_t len) {
   peer.encrypt = false;
   esp_err_t addRet = esp_now_add_peer(&peer);
   if (addRet != ESP_OK && addRet != ESP_ERR_ESPNOW_EXIST) return;
-  esp_now_send(switchAMac, data, len);
+  sendCopiesTo(switchAMac, data, len, 2);
 }
 
-// 向开关 B 发短消息（ACK_B、RDY 等）
+// 向开关 B 发短消息（ACK_B、TB、RDY 等，内部双发抗丢包）
 void sendToSwitchB(const uint8_t* data, size_t len) {
   if (!switchBMacValid || !data || len == 0) return;
   esp_now_peer_info_t peer = {};
@@ -1442,9 +1595,23 @@ void sendToSwitchB(const uint8_t* data, size_t len) {
   peer.channel = espNowPeerChannel;
   peer.ifidx = espNowIfidx;
   peer.encrypt = false;
-  esp_err_t addRet = esp_now_add_peer(&peer);
-  if (addRet != ESP_OK && addRet != ESP_ERR_ESPNOW_EXIST) return;
-  esp_now_send(switchBMac, data, len);
+  esp_err_t addRetB = esp_now_add_peer(&peer);
+  if (addRetB != ESP_OK && addRetB != ESP_ERR_ESPNOW_EXIST) return;
+  sendCopiesTo(switchBMac, data, len, 2);
+}
+
+/** COL 同步帧：'C','O','L' + H,S,V + meta（低 bit=该开关可按，高 4bit=GameState）。A/B 的 meta 不同 */
+void sendColToBothSwitches() {
+  // 目标色 = pending 队头最旧（防守）或色流下一个预告色（进攻），下发当场生成的色相
+  uint8_t h = g_game.targetHue();
+  uint8_t s = 255, v = 255;
+  uint8_t gs = (uint8_t)g_game.state();
+  uint8_t metaA = (uint8_t)((gs << 4) | (g_game.expectedButton() == 'A' ? 1 : 0));
+  uint8_t metaB = (uint8_t)((gs << 4) | (g_game.expectedButton() == 'B' ? 1 : 0));
+  uint8_t bufA[7] = {'C', 'O', 'L', h, s, v, metaA};
+  uint8_t bufB[7] = {'C', 'O', 'L', h, s, v, metaB};
+  sendToSwitchA(bufA, sizeof(bufA));
+  sendToSwitchB(bufB, sizeof(bufB));
 }
 
 // 游戏模式（Future Queue + Active Dots；tick 在 loop 中已调用）
@@ -1452,6 +1619,62 @@ void testGame() {
   g_game.renderStrip(leds, NUM_LEDS, millis(), false);
 }
 
+/** 关键指令多连发抗丢包：首包立刻发，后续拷贝按 25ms 排队，不再 delay 堵灯带 */
+#define DELAYED_COPY_SLOTS 8
+#define DELAYED_COPY_GAP_MS 25UL
+#define DELAYED_COPY_MAX_LEN 16
+struct DelayedCopy {
+  uint8_t mac[6];
+  uint8_t data[DELAYED_COPY_MAX_LEN];
+  uint8_t len;
+  uint8_t remaining;
+  unsigned long nextMs;
+};
+static DelayedCopy delayedCopies[DELAYED_COPY_SLOTS];
+
+static void enqueueDelayedCopy(const uint8_t* mac, const uint8_t* data, size_t len, int extra) {
+  if (extra <= 0 || !mac || !data || len == 0 || len > DELAYED_COPY_MAX_LEN) return;
+  for (int i = 0; i < DELAYED_COPY_SLOTS; i++) {
+    if (delayedCopies[i].remaining != 0) continue;
+    memcpy(delayedCopies[i].mac, mac, 6);
+    memcpy(delayedCopies[i].data, data, len);
+    delayedCopies[i].len = (uint8_t)len;
+    delayedCopies[i].remaining = (uint8_t)extra;
+    delayedCopies[i].nextMs = millis() + DELAYED_COPY_GAP_MS;
+    return;
+  }
+}
+
+static void flushDelayedCopies(unsigned long now) {
+  for (int i = 0; i < DELAYED_COPY_SLOTS; i++) {
+    DelayedCopy& s = delayedCopies[i];
+    if (s.remaining == 0) continue;
+    if ((long)(now - s.nextMs) < 0) continue;
+    esp_now_send(s.mac, s.data, s.len);
+    s.remaining--;
+    s.nextMs = now + DELAYED_COPY_GAP_MS;
+  }
+}
+
+void sendCopiesTo(const uint8_t* mac, const uint8_t* data, size_t len, int copies) {
+  if (!mac || !data || len == 0) return;
+  if (copies < 1) copies = 1;
+  esp_now_send(mac, data, len);
+  if (copies > 1) enqueueDelayedCopy(mac, data, len, copies - 1);
+}
+
 static void bridgeSendA(const uint8_t* data, size_t len) { sendToSwitchA(data, len); }
 
 static void bridgeSendB(const uint8_t* data, size_t len) { sendToSwitchB(data, len); }
+
+void hostResetGame() {
+  g_game.forceIdle();
+  g_game.syncTurnToIdle(switchAMacValid, switchBMacValid, bridgeSendA, bridgeSendB);
+  addLog("主机 SET：游戏已重置回待机");
+#if BUZZER_ENABLE
+  buzzerSpeedFeedback();
+#endif
+#if OLED_ENABLE
+  if (oledOk) refreshOledScreen();
+#endif
+}
