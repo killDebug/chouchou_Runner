@@ -51,12 +51,48 @@ uint8_t GameManager::peekPending() const {
   return pendingColors_[0];
 }
 
+void GameManager::clearPlayerLead() {
+  playerLeadCount_ = 0;
+}
+
+bool GameManager::pushPlayerLead(uint8_t colorIndex, uint8_t hue) {
+  if (playerLeadCount_ >= kMaxPending) return false;
+  playerLeadColors_[playerLeadCount_] = colorIndex;
+  playerLeadHues_[playerLeadCount_] = hue;
+  playerLeadCount_++;
+  return true;
+}
+
+bool GameManager::popPlayerLead(uint8_t& colorIndex, uint8_t& hue) {
+  if (playerLeadCount_ <= 0) return false;
+  colorIndex = playerLeadColors_[0];
+  hue = playerLeadHues_[0];
+  if (playerLeadCount_ > 1) {
+    memmove(playerLeadColors_, playerLeadColors_ + 1, (size_t)(playerLeadCount_ - 1));
+    memmove(playerLeadHues_, playerLeadHues_ + 1, (size_t)(playerLeadCount_ - 1));
+  }
+  playerLeadCount_--;
+  return true;
+}
+
+uint8_t GameManager::peekPlayerLead() const {
+  if (playerLeadCount_ <= 0) return 0;
+  return playerLeadColors_[0];
+}
+
+uint8_t GameManager::peekPlayerLeadHue() const {
+  if (playerLeadCount_ <= 0) return 0;
+  return playerLeadHues_[0];
+}
+
 // ---------- 场上光点 ----------
 
 void GameManager::clearDots() {
   dotCount_ = 0;
   for (int i = 0; i < kMaxDots; i++) dots_[i].active = false;
   clearPending();
+  clearPlayerLead();
+  playerShotThisTick_ = false;
 }
 
 void GameManager::compactDots() {
@@ -70,16 +106,35 @@ void GameManager::compactDots() {
   dotCount_ = w;
 }
 
-bool GameManager::addDot(int position, int direction, uint8_t colorIndex) {
+bool GameManager::findOldestComputerHue(uint8_t colorIndex, uint8_t& hue) const {
+  int bestPos = -1;
+  bool found = false;
+  for (int i = 0; i < kMaxDots; i++) {
+    if (!dots_[i].active || dots_[i].direction != +1) continue;
+    if (dots_[i].colorIndex != colorIndex) continue;
+    if (!found || dots_[i].position > bestPos) {
+      found = true;
+      bestPos = dots_[i].position;
+      hue = dots_[i].hue;
+    }
+  }
+  return found;
+}
+
+bool GameManager::addDot(int position, int direction, uint8_t colorIndex, int16_t fixedHue, uint8_t* outHue) {
   if (dotCount_ >= kMaxDots) return false;
   for (int i = 0; i < kMaxDots; i++) {
     if (!dots_[i].active) {
       dots_[i].id = nextDotId_++;
       dots_[i].colorIndex = colorIndex;
-      // 色相微抖：基础色相 ±5 随机偏移，同色每次发射有微妙质感差异；碰撞判定仍用 colorIndex
-      int base = gameThemeHue(themeIndex_, colorIndex);
-      int jitter = (int)(esp_random() % 11) - 5;  // -5..+5
-      dots_[i].hue = (uint8_t)((base + jitter + 256) & 0xFF);
+      if (fixedHue >= 0) {
+        dots_[i].hue = (uint8_t)fixedHue;
+      } else {
+        int base = gameThemeHue(themeIndex_, colorIndex);
+        int jitter = (int)(esp_random() % 11) - 5;
+        dots_[i].hue = (uint8_t)((base + jitter + 256) & 0xFF);
+      }
+      if (outHue) *outHue = dots_[i].hue;
       dots_[i].position = position;
       dots_[i].direction = (int8_t)direction;
       dots_[i].active = true;
@@ -133,15 +188,25 @@ void GameManager::setGameResult(GameState r, bool switchAMacValid, bool switchBM
 
 void GameManager::tickRunning(unsigned long now, bool switchAMacValid, bool switchBMacValid, void (*sendToA)(const uint8_t*, size_t),
                               void (*sendToB)(const uint8_t*, size_t)) {
-  // 电脑严格按间隔定时在 0 端出点；颜色压入 pending FIFO 形成防守压力
+  // 电脑按间隔出点：有玩家抢先则跟同色同色相；否则取色流。玩家刚出手的同一帧不再出新色。
   if (now - lastComputerSpawnMs_ >= (unsigned long)computerSpawnIntervalMs_) {
-    uint8_t c = colors_.currentColor();
-    if (addDot(0, +1, c)) {
-      pushPending(c);
-      colors_.advanceWave();
-      lastComputerSpawnMs_ = now;
+    if (playerLeadCount_ > 0) {
+      uint8_t c = peekPlayerLead();
+      uint8_t h = peekPlayerLeadHue();
+      if (addDot(0, +1, c, (int16_t)h)) {
+        popPlayerLead(c, h);
+        lastComputerSpawnMs_ = now;
+      }
+    } else if (!playerShotThisTick_) {
+      uint8_t c = colors_.currentColor();
+      if (addDot(0, +1, c)) {
+        pushPending(c);
+        colors_.advanceWave();
+        lastComputerSpawnMs_ = now;
+      }
     }
   }
+  playerShotThisTick_ = false;
 
   if (now - lastMoveMs_ < (unsigned long)moveIntervalMs_) {
     return;
@@ -273,16 +338,25 @@ void GameManager::onButtonPress(char btn, unsigned long now, bool connReady, boo
   }
 
   uint8_t c = 0;
-  if (pendingCount_ > 0) {
-    // 防守模式：跟队头「最旧」的电脑点同色，在末端出玩家点对撞消除
-    if (!popPending(c)) return;
+  int16_t hue = -1;
+  const bool defending = pendingCount_ > 0;
+  if (defending) {
+    c = peekPending();
+    uint8_t matchedHue = 0;
+    if (findOldestComputerHue(c, matchedHue)) hue = (int16_t)matchedHue;
   } else {
-    // 进攻模式：场上电脑点已消光，允许继续发射！取色流下一个预告色向电脑端推进
+    if (playerLeadCount_ >= kMaxPending) return;
     c = colors_.currentColor();
-    colors_.advanceWave();
   }
-  spawnPlayerDot(c);
-  // 电脑节拍不受玩家操作影响（严格定时）；只切换期望按键
+  uint8_t spawnedHue = 0;
+  if (!addDot(numLeds_ - 1, -1, c, hue, &spawnedHue)) return;
+  if (defending) {
+    popPending(c);
+  } else {
+    colors_.advanceWave();
+    pushPlayerLead(c, spawnedHue);
+  }
+  playerShotThisTick_ = true;
   setTurn(btn == 'A' ? 'B' : 'A', switchAMacValid, switchBMacValid, sendToA, sendToB);
   fireEvent(GameEvent::SHOOT);
 }

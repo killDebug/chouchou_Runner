@@ -28,7 +28,7 @@ class GameManager {
   int pendingCatchUpCount() const { return pendingCount_; }
   unsigned long pauseStartedMs() const { return pauseStartedMs_; }
 
-  /** 当前"目标色"colorIndex：pending 有货 = 队头最旧电脑点（防守）；空 = 色流下一个预告色（进攻） */
+  /** 当前目标色：有积压=队头最旧（防守）；空=色流预告色（进攻，电脑下一拍跟同色） */
   uint8_t targetColorIndex() const;
 
   void resetToIdle();
@@ -60,7 +60,8 @@ class GameManager {
   void fireEvent(GameEvent e);
   void clearDots();
   void compactDots();
-  bool addDot(int position, int direction, uint8_t colorIndex);
+  bool addDot(int position, int direction, uint8_t colorIndex, int16_t fixedHue = -1, uint8_t* outHue = nullptr);
+  bool findOldestComputerHue(uint8_t colorIndex, uint8_t& hue) const;
   void spawnComputerDot(uint8_t colorIndex);
   void spawnPlayerDot(uint8_t colorIndex);
   void setTurn(char nextExpected, bool switchAMacValid, bool switchBMacValid, void (*sendToA)(const uint8_t*, size_t),
@@ -73,10 +74,19 @@ class GameManager {
   bool pushPending(uint8_t colorIndex);
   bool popPending(uint8_t& colorIndex);
   uint8_t peekPending() const;
+  void clearPlayerLead();
+  bool pushPlayerLead(uint8_t colorIndex, uint8_t hue);
+  bool popPlayerLead(uint8_t& colorIndex, uint8_t& hue);
+  uint8_t peekPlayerLead() const;
+  uint8_t peekPlayerLeadHue() const;
 
   static constexpr int kMaxPending = 16;
   uint8_t pendingColors_[kMaxPending];
   int pendingCount_ = 0;
+  uint8_t playerLeadColors_[kMaxPending];
+  uint8_t playerLeadHues_[kMaxPending];
+  int playerLeadCount_ = 0;
+  bool playerShotThisTick_ = false;
 
   ColorStream colors_;
   GameDot dots_[kMaxDots];
