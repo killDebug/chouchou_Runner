@@ -1,9 +1,14 @@
 #pragma once
 
 #include "game_types.h"
-#include "queue_manager.h"
+#include "color_stream.h"
+#include "game_palette.h"
 #include <FastLED.h>
 #include <stdint.h>
+
+/** 游戏事件 → 主机播放对应蜂鸣器音效（main.cpp 注册回调；回调内勿阻塞） */
+enum class GameEvent : uint8_t { START, SHOOT, COLLISION, BAD, WIN, LOSE };
+typedef void (*GameEventFn)(GameEvent);
 
 class GameManager {
  public:
@@ -12,19 +17,24 @@ class GameManager {
 
   void configure(int numLeds, int computerSpawnIntervalMs, int moveIntervalMs);
   void setComputerSpawnIntervalMs(int ms) { computerSpawnIntervalMs_ = ms; }
+  /** 注册音效事件回调（main.cpp 的无阻塞蜂鸣器序列器） */
+  void setEventCallback(GameEventFn cb) { eventCb_ = cb; }
 
   GameState state() const { return state_; }
   int dotCount() const { return dotCount_; }
   char expectedButton() const { return expectedButton_; }
-  size_t queueSize() const { return queue_.size(); }
-  uint8_t queueHeadColor() const { return queue_.peekHead(); }
+  uint32_t colorWaveIndex() const { return colors_.waveIndex(); }
+  uint8_t colorThemeIndex() const { return themeIndex_; }
+  int pendingCatchUpCount() const { return pendingCount_; }
   unsigned long pauseStartedMs() const { return pauseStartedMs_; }
+
+  /** 当前"目标色"colorIndex：pending 有货 = 队头最旧电脑点（防守）；空 = 色流下一个预告色（进攻） */
+  uint8_t targetColorIndex() const;
 
   void resetToIdle();
   void startGame(unsigned long now, bool countAsFirstPress, bool switchAMacValid, bool switchBMacValid,
                  void (*sendToA)(const uint8_t*, size_t), void (*sendToB)(const uint8_t*, size_t));
   void forceIdle();
-  // RST / 双击回 IDLE 后恢复「下一轮由 A 开始」的 TA/RDY
   void syncTurnToIdle(bool switchAMacValid, bool switchBMacValid, void (*sendToA)(const uint8_t*, size_t),
                       void (*sendToB)(const uint8_t*, size_t));
 
@@ -39,40 +49,50 @@ class GameManager {
   void resumeFromPause(unsigned long now);
   bool shouldHardResetPause(unsigned long now) const;
 
+  /** 开关双击 RST：仅 IDLE / WIN / LOSE 允许；RUNNING / PAUSE 对战过程中拒绝 */
+  bool allowSwitchDoubleTapReset() const;
+
   void renderStrip(CRGB* leds, int numLeds, unsigned long now, bool connWaitingSearch);
 
   const GameDot* dots() const { return dots_; }
 
  private:
+  void fireEvent(GameEvent e);
   void clearDots();
   void compactDots();
   bool addDot(int position, int direction, uint8_t colorIndex);
+  void spawnComputerDot(uint8_t colorIndex);
+  void spawnPlayerDot(uint8_t colorIndex);
   void setTurn(char nextExpected, bool switchAMacValid, bool switchBMacValid, void (*sendToA)(const uint8_t*, size_t),
                void (*sendToB)(const uint8_t*, size_t));
   void setGameResult(GameState r, bool switchAMacValid, bool switchBMacValid, void (*sendToA)(const uint8_t*, size_t),
                      void (*sendToB)(const uint8_t*, size_t));
   void tickRunning(unsigned long now, bool switchAMacValid, bool switchBMacValid, void (*sendToA)(const uint8_t*, size_t),
                    void (*sendToB)(const uint8_t*, size_t));
-  // 暂不下发 COL（按钮灯环不同步）；仅保留接口便于以后打开
-  void syncButtonsColor(unsigned long now, bool switchAMacValid, bool switchBMacValid,
-                        void (*sendToA)(const uint8_t*, size_t), void (*sendToB)(const uint8_t*, size_t));
+  void clearPending();
+  bool pushPending(uint8_t colorIndex);
+  bool popPending(uint8_t& colorIndex);
+  uint8_t peekPending() const;
 
-  QueueManager queue_;
+  static constexpr int kMaxPending = 16;
+  uint8_t pendingColors_[kMaxPending];
+  int pendingCount_ = 0;
+
+  ColorStream colors_;
   GameDot dots_[kMaxDots];
   int dotCount_ = 0;
   uint32_t nextDotId_ = 1;
   GameState state_ = GameState::IDLE;
   char expectedButton_ = 'A';
+  uint8_t themeIndex_ = 0;
   int numLeds_ = 460;
   int computerSpawnIntervalMs_ = 2000;
   int moveIntervalMs_ = 50;
   unsigned long lastMoveMs_ = 0;
   unsigned long lastComputerSpawnMs_ = 0;
   unsigned long pauseStartedMs_ = 0;
-
-  static constexpr unsigned long kRestartDoubleMs = 450;
-  unsigned long lastPressA_ = 0;
-  unsigned long lastPressB_ = 0;
+  unsigned long resultAtMs_ = 0;  // WIN/LOSE 时刻，用于胜利波浪动画
+  GameEventFn eventCb_ = nullptr;
 };
 
 extern GameManager g_game;
