@@ -10,10 +10,12 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <driver/gpio.h>
+#include <driver/i2s.h>
+#include <math.h>
 #include "game/game_manager.h"
 
-// WS2812B配置
-#define LED_PIN 2          // ESP32-C3的GPIO2，可根据实际接线修改
+// WS2812B配置（ESP32-S3 N8R8：信号脚 GPIO4→12 连续，见 引脚迁移.md）
+#define LED_PIN 2          // 灯带 DIN → GPIO2（单独 XH-2）
 // 规格：5m、约 92 颗/米 → 理论约 460 颗；若实际只接了其中一段请按真实颗数改（例如只焊 72 颗就写 72）
 #define NUM_LEDS 460
 #define LED_TYPE WS2812B
@@ -23,7 +25,7 @@
 // WiFi 配置（用于 OTA）：优先使用 NVS 保存的 SSID/密码，没有或连不上则开 AP 配网
 const char* defaultSsid     = "CMCC-tpXT";
 const char* defaultPassword = "rw6s6we7";
-const char* hostname = "ESP32-C3-LED";
+const char* hostname = "ESP32-S3-LED";
 
 // ESP-NOW 长距离模式开关：三端（主机+A+B）需同时开启/关闭；LR 提升约 10dB 链路预算
 #define ENABLE_ESPNOW_LR 1
@@ -50,15 +52,15 @@ uint8_t espNowChannel = 0;              // 主机添加广播 peer 时用的信�
 const bool ENABLE_OFFLINE_MODE = true;  // 离线模式开关：无路由器时在 AP 模式也启用 ESP-NOW
 wifi_interface_t espNowIfidx = WIFI_IF_STA;
 uint8_t espNowPeerChannel = 0;          // STA=0(当前信道)，AP=固定 AP 信道(1)
-// 主机硬件按键：GPIO7 按住 2～5s 松开切换 OLED 调试，满 5s 强制离线重启；GPIO8/9 调速
+// 主机硬件按键（S3）：GPIO6 功能键；GPIO7 加速；GPIO8 减速（XH-7 人机口，与 OLED 同排 GPIO4–8）
 const bool ENABLE_FORCE_OFFLINE_SWITCH = true;
-const int FORCE_OFFLINE_SWITCH_GPIO = 7;
-const int GAME_SPEED_UP_GPIO = 8;
-const int GAME_SPEED_DOWN_GPIO = 9;
+const int FORCE_OFFLINE_SWITCH_GPIO = 6;
+const int GAME_SPEED_UP_GPIO = 7;
+const int GAME_SPEED_DOWN_GPIO = 8;
 const unsigned long FORCE_OFFLINE_HOLD_MS = 5000UL;
-/** GPIO7 按住 2s～5s 内松开：切换 OLED 调试（与满 5s 强制离线区分） */
+/** GPIO6 按住 2s～5s 内松开：切换 OLED 调试（与满 5s 强制离线区分） */
 const unsigned long OLED_DEBUG_HOLD_MIN_MS = 2000UL;
-/** GPIO7 三连击（短按）：开关「详细串口/日志」（已识别/回传/收包等）；默认关，仅保留 A/B 按键日志 */
+/** GPIO6 三连击（短按）：开关「详细串口/日志」（已识别/回传/收包等）；默认关，仅保留 A/B 按键日志 */
 const unsigned long GPIO7_TAP_WINDOW_MS = 900UL;
 const unsigned long GPIO7_SHORT_PRESS_MAX_MS = 420UL;
 // 电脑出点间隔（毫秒）：由速度档位 1～30 映射，30=最快，1=最慢
@@ -77,18 +79,29 @@ static int intervalMsFromSpeedLevel(int level) {
 }
 
 // ---------- OLED：GME12864-49 0.96" 128×64 I2C（四线：VCC/GND + SDA/SCL）----------
-// 接线：VDD→5V、GND→GND；SCL→GPIO20、SDA→GPIO10（模块丝印常为 SCK=SCL）
+// XH-7 人机口：Pin1 GND、Pin2 5Vin、Pin3 SDA=GPIO4、Pin4 SCL=GPIO5、Pin5–7=键 GPIO6/7/8
 #define OLED_ENABLE       1
-#define OLED_SDA          10
-#define OLED_SCL          20
+#define OLED_SDA          4
+#define OLED_SCL          5
 #define OLED_I2C_ADDR     0x3C   // 白屏常见 0x3C；若全黑可试 0x3D
 #define OLED_SCREEN_W     128
 #define OLED_SCREEN_H     64
 #define OLED_RESET        -1
 
-// ---------- 压电蜂鸣器：GPIO21（血糖仪拆机件多为压电片，需方波/PWM 驱动，直流常亮不响）----------
+// ---------- 压电蜂鸣器：GPIO9（紧接人机口连续脚；上人声后可关 BUZZER_ENABLE）----------
 #define BUZZER_ENABLE       1
-#define BUZZER_PIN          21
+#define BUZZER_PIN          9
+
+// ---------- MAX98357 I2S 功放测试：BCLK=10 / LRC=11 / DIN=12（SD 接 Vin）----------
+// 手册支持的 LRCLK：8/16/32/44.1/48/88.2/96 kHz —— 禁止 22.05k（无声）
+#define AMP_TEST_ENABLE     1
+#define I2S_BCLK_PIN        10
+#define I2S_LRC_PIN         11
+#define I2S_DOUT_PIN        12
+#define I2S_PORT_NUM        I2S_NUM_0
+#define AMP_SAMPLE_RATE     16000
+#define AMP_TONE_AMPLITUDE  30000
+#define AMP_BUFFER_FRAMES   256
 
 #if OLED_ENABLE
 // 全缓冲 + 文泉驿 12px 中文，避免 Adafruit 默认字库中文乱码
@@ -173,12 +186,12 @@ int currentLed = 0;
 String serialInput = "";
 
 const int moveIntervalMs = 50;
-// 游戏速度档位：1=最慢，30=最快，默认 15；GPIO8 +1，GPIO9 -1，每次 ±1
+// 游戏速度档位：1=最慢，30=最快，默认 15；GPIO7 +1，GPIO8 -1，每次 ±1
 int gameSpeedLevel = GAME_SPEED_LEVEL_DEFAULT;
 int computerSpawnIntervalMs = intervalMsFromSpeedLevel(GAME_SPEED_LEVEL_DEFAULT);  // 与 gameSpeedLevel 同步
-/** 调试模式：游戏运行中首行 Spd + 下方日志；未运行时全屏日志。GPIO7 长按 2～5s 松开切换 */
+/** 调试模式：游戏运行中首行 Spd + 下方日志；未运行时全屏日志。GPIO6 长按 2～5s 松开切换 */
 bool oledSerialMirrorMode = false;
-/** 详细开关/ESP-NOW 日志：GPIO7 三连击切换；关时串口与网页日志不刷屏，仅保留 A/B 按键相关 */
+/** 详细开关/ESP-NOW 日志：GPIO6 三连击切换；关时串口与网页日志不刷屏，仅保留 A/B 按键相关 */
 bool verboseSwitchLog = false;
 
 static const char* hostGameStateLabel(GameState s) {
@@ -241,6 +254,144 @@ void buzzerSpeedFeedback();
 void setupOled();
 void refreshOledScreen();
 static void syncSpawnIntervalFromSpeed();
+#if AMP_TEST_ENABLE
+static bool setupAmpI2s(bool swapBclkLrc);
+void playAmpTestTone(bool swapBclkLrc = false);
+#endif
+
+#if AMP_TEST_ENABLE
+static bool s_ampI2sReady = false;
+static bool s_ampSwapBclkLrc = false;
+
+static void teardownAmpI2s() {
+  if (!s_ampI2sReady) return;
+  i2s_zero_dma_buffer(I2S_PORT_NUM);
+  i2s_driver_uninstall(I2S_PORT_NUM);
+  s_ampI2sReady = false;
+}
+
+/** 初始化 I2S → MAX98357。swap=true 时对调 BCLK/LRC，用于排查两根时钟线焊反 */
+static bool setupAmpI2s(bool swapBclkLrc) {
+  if (s_ampI2sReady && s_ampSwapBclkLrc == swapBclkLrc) return true;
+  teardownAmpI2s();
+  s_ampSwapBclkLrc = swapBclkLrc;
+
+  const int bclkPin = swapBclkLrc ? I2S_LRC_PIN : I2S_BCLK_PIN;
+  const int lrcPin = swapBclkLrc ? I2S_BCLK_PIN : I2S_LRC_PIN;
+
+  pinMode(I2S_BCLK_PIN, OUTPUT);
+  pinMode(I2S_LRC_PIN, OUTPUT);
+  pinMode(I2S_DOUT_PIN, OUTPUT);
+  digitalWrite(I2S_BCLK_PIN, LOW);
+  digitalWrite(I2S_LRC_PIN, LOW);
+  digitalWrite(I2S_DOUT_PIN, LOW);
+
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = AMP_SAMPLE_RATE;
+  // ESP32-S3 + MAX98357：用 32bit 样本槽，音频放在高 16 位
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 8;
+  cfg.dma_buf_len = AMP_BUFFER_FRAMES;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
+  cfg.fixed_mclk = 0;
+  cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+  cfg.bits_per_chan = I2S_BITS_PER_CHAN_32BIT;
+
+  i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
+  pins.bck_io_num = bclkPin;
+  pins.ws_io_num = lrcPin;
+  pins.data_out_num = I2S_DOUT_PIN;
+  pins.data_in_num = I2S_PIN_NO_CHANGE;
+
+  esp_err_t err = i2s_driver_install(I2S_PORT_NUM, &cfg, 0, nullptr);
+  if (err != ESP_OK) {
+    Serial.printf("I2S install fail: %s\n", esp_err_to_name(err));
+    addLog(String("I2S 安装失败: ") + esp_err_to_name(err));
+    return false;
+  }
+  err = i2s_set_pin(I2S_PORT_NUM, &pins);
+  if (err != ESP_OK) {
+    Serial.printf("I2S set_pin fail: %s\n", esp_err_to_name(err));
+    addLog(String("I2S 引脚失败: ") + esp_err_to_name(err));
+    i2s_driver_uninstall(I2S_PORT_NUM);
+    return false;
+  }
+  err = i2s_set_clk(I2S_PORT_NUM, AMP_SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
+  if (err != ESP_OK) {
+    Serial.printf("I2S set_clk fail: %s\n", esp_err_to_name(err));
+  }
+  i2s_zero_dma_buffer(I2S_PORT_NUM);
+  delay(20);  // MAX98357 tON≈7.5ms
+  s_ampI2sReady = true;
+  Serial.printf("I2S ready 16kHz stereo DIN=%d BCLK_gpio=%d LRC_gpio=%d swap=%d\n",
+                I2S_DOUT_PIN, bclkPin, lrcPin, (int)swapBclkLrc);
+  addLog(String("I2S就绪 16k DIN12 BCK") + bclkPin + " LRC" + lrcPin + (swapBclkLrc ? " SWAP" : ""));
+  return true;
+}
+
+/** 播两声正弦；swapBclkLrc=true 时软件对调时钟脚（不用改焊） */
+void playAmpTestTone(bool swapBclkLrc) {
+  if (!setupAmpI2s(swapBclkLrc)) return;
+
+  const float freqs[] = {880.0f, 1320.0f};
+  const int toneMs = 700;
+  const int gapMs = 150;
+  const int framesPerTone = (AMP_SAMPLE_RATE * toneMs) / 1000;
+  // 32bit slot：每声道写 int32（有效样本在高 16 位）
+  int32_t samples[AMP_BUFFER_FRAMES * 2];
+
+  Serial.println(swapBclkLrc
+                     ? "MAX98357：测试音（BCLK/LRC 已软件对调）"
+                     : "MAX98357：测试音 16kHz（听喇叭）");
+  addLog(swapBclkLrc ? "功放测试 SWAP" : "功放测试 16kHz");
+
+  size_t totalWritten = 0;
+  for (int t = 0; t < 2; t++) {
+    const float phaseInc = 2.0f * (float)M_PI * freqs[t] / (float)AMP_SAMPLE_RATE;
+    float phase = 0.0f;
+    int framesLeft = framesPerTone;
+    while (framesLeft > 0) {
+      int n = framesLeft < AMP_BUFFER_FRAMES ? framesLeft : AMP_BUFFER_FRAMES;
+      for (int i = 0; i < n; i++) {
+        int16_t s16 = (int16_t)(sinf(phase) * (float)AMP_TONE_AMPLITUDE);
+        int32_t s32 = ((int32_t)s16) << 16;
+        samples[2 * i] = s32;
+        samples[2 * i + 1] = s32;
+        phase += phaseInc;
+        if (phase > 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+      }
+      size_t written = 0;
+      esp_err_t err = i2s_write(I2S_PORT_NUM, samples, n * 2 * sizeof(int32_t), &written, portMAX_DELAY);
+      if (err != ESP_OK) {
+        Serial.printf("I2S write fail: %s\n", esp_err_to_name(err));
+        return;
+      }
+      totalWritten += written;
+      framesLeft -= n;
+    }
+    if (t == 0) {
+      memset(samples, 0, sizeof(samples));
+      int gapFrames = (AMP_SAMPLE_RATE * gapMs) / 1000;
+      while (gapFrames > 0) {
+        int n = gapFrames < AMP_BUFFER_FRAMES ? gapFrames : AMP_BUFFER_FRAMES;
+        size_t written = 0;
+        i2s_write(I2S_PORT_NUM, samples, n * 2 * sizeof(int32_t), &written, portMAX_DELAY);
+        gapFrames -= n;
+      }
+    }
+  }
+  delay(80);
+  i2s_zero_dma_buffer(I2S_PORT_NUM);
+  Serial.printf("MAX98357：结束 bytes=%u\n", (unsigned)totalWritten);
+  addLog(String("功放测试结束 ") + String((unsigned)totalWritten));
+}
+#endif
 
 /** 压电片：GPIO 最大驱动 + 多段短鸣（体感更响）；勿长时间直流 */
 void playStartupBeep() {
@@ -370,7 +521,7 @@ void setupOled() {
   u8g2.enableUTF8Print();
   u8g2.setFont(u8g2_font_wqy12_t_chinese1);
   u8g2.clearBuffer();
-  u8g2.drawUTF8(0, 12, "ESP32-C3 LED Host");
+  u8g2.drawUTF8(0, 12, "ESP32-S3 LED Host");
   u8g2.drawUTF8(0, 24, hostname);
   u8g2.drawUTF8(0, 36, (String("LEDs=") + String(NUM_LEDS)).c_str());
   u8g2.drawUTF8(0, 48, "Boot...");
@@ -501,7 +652,7 @@ void refreshOledScreen() {
       if (logLineCount <= 0) {
         String le[2];
         le[0] = "LOG(empty)";
-        le[1] = "GPIO7 2~5s Dbg";
+        le[1] = "GPIO6 2~5s Dbg";
         oledDrawLinesUtf8(le, 2);
       } else {
         int n = logLineCount < OLED_PAGE_LINES ? logLineCount : OLED_PAGE_LINES;
@@ -539,14 +690,14 @@ void refreshOledScreen() {
 }
 
 void setup() {
-  // 初始化串口 - ESP32-C3使用USB CDC，波特率115200
+  // 初始化串口 - ESP32-S3 N8R8 经 CH343 UART，波特率 115200
   Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT || defined(CONFIG_TINYUSB_CDC_ENABLED)
   Serial.setTxBufferSize(4096);
 #endif
   
-  // 等待USB CDC枚举完成 - ESP32-C3需要这个时间
-  delay(2000);
+  // 短暂等待串口稳定（CH343 无需长等 CDC 枚举）
+  delay(500);
   
   // 立即输出，确保能看到 - 使用简单的ASCII字符
   Serial.write(0x0A);  // 换行
@@ -557,45 +708,46 @@ void setup() {
   Serial.print("Start time: ");
   Serial.print(millis());
   Serial.println("ms");
-  Serial.println("ESP32-C3 Initializing...");
+  Serial.println("ESP32-S3 N8R8 Initializing...");
   Serial.println("默认：搜索开关 A/B（灯带蓝呼吸）；双开关就绪后灯带彩色流水，仅按 A 可开始游戏");
   delay(500);
   
-  // 再次输出，确保串口工作（勿 Serial.flush：未开串口监视器时 USB CDC 可能永久阻塞）
+  // 再次输出，确保串口工作（勿 Serial.flush：未开串口监视器时可能阻塞）
   Serial.println("Serial port is working!");
   delay(200);
   addLog("========================================");
   addLog("=== 主机 (LED 主控) 启动 ===");
   addLog("========================================");
 
+  // 先测功放再蜂鸣，避免 tone/LEDC 抢资源；串口 amp / ampswap 可重播
+#if AMP_TEST_ENABLE
+  playAmpTestTone(false);
+#endif
   playStartupBeep();
   setupOled();
-  
-  // 初始化FastLED
-  Serial.println("开始初始化FastLED...");
-  
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-  FastLED.setBrightness(BRIGHTNESS);
-  
-  // 清空所有LED
-  FastLED.clear();
-  FastLED.show();
-  g_game.configure(NUM_LEDS, computerSpawnIntervalMs, moveIntervalMs);
-  g_game.setEventCallback(onGameEvent);  // 游戏事件 → 蜂鸣器音效
+
   pinMode(FORCE_OFFLINE_SWITCH_GPIO, INPUT_PULLUP);
   pinMode(GAME_SPEED_UP_GPIO, INPUT_PULLUP);
   pinMode(GAME_SPEED_DOWN_GPIO, INPUT_PULLUP);
   loadHostConfig();
-  
+
+  // 先起 WiFi/AP，再初始化灯带：避免 460 灯阻塞刷灯抢射频；配网期手机才能搜到 Service-Setup
+  setupWiFi();
+  setupOTA();
+
+  // 初始化 FastLED（配网 AP 模式下 loop 会降频刷灯，保证信标）
+  Serial.println("开始初始化FastLED...");
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
+  g_game.configure(NUM_LEDS, computerSpawnIntervalMs, moveIntervalMs);
+  g_game.setEventCallback(onGameEvent);  // 游戏事件 → 蜂鸣器音效
   Serial.println("LED初始化完成！");
   addLog("LED 初始化完成，数量: " + String(NUM_LEDS));
   Serial.print("LED数量: ");
   Serial.println(NUM_LEDS);
-  
-  // 暂时禁用WiFi和OTA（用于测试）
-  // 初始化WiFi和OTA
-  setupWiFi();
-  setupOTA();
+
   bool canStartEspNow = wifiConnected || (ENABLE_OFFLINE_MODE && wifiApMode);
   if (canStartEspNow) {
     delay(800);  // WiFi 稳定后再初始化 ESP-NOW
@@ -603,13 +755,19 @@ void setup() {
     espNowPeerChannel = wifiConnected ? 0 : 1;
     // 提升 ESP-NOW 链路质量（解决“稍远/轻微遮挡就丢包”）：
     // 1) 关 STA 省电——modem sleep 会让 ESP-NOW 收包大量丢失；2) 发射功率拉满；
-    // 3) 可选 802.11 LR 长距离协议（三端必须同时开启；与路由器 STA 可共存，若异常改为 0）
+    // 3) LR 仅在 STA 在线模式开启——AP 配网时开 LR 会导致手机搜不到 Service-Setup
     esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_max_tx_power(84);
 #if ENABLE_ESPNOW_LR
-    esp_wifi_set_protocol(espNowIfidx,
-                          (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
-    addLog("ESP-NOW：已关省电+满功率+LR 长距离模式");
+    if (wifiConnected) {
+      esp_wifi_set_protocol(espNowIfidx,
+                            (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+      addLog("ESP-NOW：已关省电+满功率+LR（STA）");
+    } else {
+      esp_wifi_set_protocol(espNowIfidx,
+                            (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+      addLog("ESP-NOW：已关省电+满功率（AP 配网，不开 LR）");
+    }
 #else
     addLog("ESP-NOW：已关省电+满功率");
 #endif
@@ -657,8 +815,8 @@ void setup() {
   Serial.println("无线开关A 发 A、开关B 发 B，主程序可区分；关键消息三连发+主机去重，COL 同步轮次与颜色");
   Serial.println("输入 'brightness <0-255>' - 设置亮度（例如: brightness 100）");
   Serial.println("输入 'status' - 查看当前状态");
-  Serial.println("输入 'debug on/off/debug' - OLED 调试；GPIO7 长按2~5s 同效");
-  Serial.println("输入 'verbose on/off' - 详细开关日志；GPIO7 连按3次短按同效");
+  Serial.println("输入 'debug on/off/debug' - OLED 调试；GPIO6 长按2~5s 同效");
+  Serial.println("输入 'verbose on/off' - 详细开关日志；GPIO6 连按3次短按同效");
   Serial.println("输入 'espnow on'|'espnow off' - ESP-NOW 收包 hex 调试");
   Serial.print("\n当前模式: ");
   printCurrentMode();
@@ -678,7 +836,7 @@ void loadHostConfig() {
   hostPrefs.begin("hostcfg", true);
   forceOfflineBySwitch = hostPrefs.getBool("forceoff", false);
   hostPrefs.end();
-  if (forceOfflineBySwitch) addLog("强制离线:已启用（GPIO7 长按5s切换）");
+  if (forceOfflineBySwitch) addLog("强制离线:已启用（GPIO6 长按5s切换）");
 }
 
 void saveForceOfflineConfig(bool enabled) {
@@ -693,15 +851,21 @@ void startConfigAP() {
   wifiConnected = false;
 
   WiFi.mode(WIFI_AP);
+  // AP 配网必须保持标准 11b/g/n，禁止 LR，否则多数手机/电脑扫不到热点
+  esp_wifi_set_protocol(WIFI_IF_AP,
+                        (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
   const char* apSsid = "Service-Setup";
   const char* apPass = "setup1234";
-  WiFi.softAP(apSsid, apPass, 1);
+  bool apOk = WiFi.softAP(apSsid, apPass, 1 /*channel*/, 0 /*not hidden*/, 4);
   IPAddress apIP = WiFi.softAPIP();
 
   Serial.println("进入 WiFi 配网模式 (AP)");
   addLog("进入 WiFi 配网模式 (AP)");
-  addLog("AP SSID: " + String(apSsid) + " 密码: " + String(apPass));
+  addLog(String("softAP ") + (apOk ? "OK" : "FAIL") + " SSID:" + apSsid + " 密码:" + apPass);
   addLog("AP IP: " + apIP.toString() + " -> 浏览器打开配置");
+  if (!apOk) {
+    Serial.println("softAP 启动失败！检查天线/供电");
+  }
 
   // 默认首页：与 /status 相同，展示串口日志区；WiFi 表单在 /config
   configServer.on("/", handleStatusPage);
@@ -740,6 +904,16 @@ void setupWiFi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
+  // 诊断射频：先扫一遍周围 2.4G，0 个则多半是天线/模组问题
+  Serial.println("扫描周围 WiFi（诊断天线）...");
+  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+  addLog("WiFi 扫描到 " + String(n) + " 个热点");
+  Serial.println("WiFi 扫描到 " + String(n) + " 个热点");
+  for (int i = 0; i < n && i < 8; i++) {
+    Serial.printf("  [%d] %s ch=%d rssi=%d\n", i, WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+  }
+  WiFi.scanDelete();
+
   WiFi.begin(trySsid.c_str(), tryPass.c_str());
 
   unsigned long start = millis();
@@ -857,43 +1031,114 @@ void setupOTA() {
 }
 
 void handleConfigRoot() {
-  String page = R"(
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>主机 WiFi 配置</title>
-    <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; }
-      input { padding: 6px 8px; width: 260px; max-width: 100%; }
-      button { padding: 6px 18px; margin-top: 12px; }
-    </style>
-  </head>
-  <body>
-    <h2>主机 (LED 主控) WiFi 配置</h2>
-    <p><a href="/">返回首页（状态与串口日志）</a></p>
-    <form method="POST" action="/save">
-      <div>
-        <label>SSID：<br/><input name="ssid" /></label>
-      </div>
-      <br/>
-      <div>
-        <label>密码：<br/><input name="pass" type="password" /></label>
-      </div>
-      <br/>
-      <button type="submit">保存并重启</button>
-    </form>
-    <p>保存后设备会重启并尝试连接新 WiFi。</p>
-    <p><a href="/">返回状态与日志</a></p>
-  </body>
-</html>
-)";
+  // AP 模式下临时 AP+STA 才能扫网；扫完恢复纯 AP（兼容 iPhone 连配网热点）
+  wifi_mode_t modeBefore = WiFi.getMode();
+  bool restoreApOnly = (modeBefore == WIFI_MODE_AP);
+  if (restoreApOnly) {
+    WiFi.mode(WIFI_AP_STA);
+    delay(50);
+  }
+
+  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+  String options;
+  options.reserve((size_t)max(n, 0) * 96 + 128);
+  options += F("<option value=\"\">-- 请选择附近 WiFi --</option>");
+
+  // 按信号强度顺序去重 SSID（scan 已按 RSSI 排序）
+  const int kMaxOpt = 30;
+  String seen[kMaxOpt];
+  int seenCount = 0;
+  int listed = 0;
+  for (int i = 0; i < n && listed < kMaxOpt; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    bool dup = false;
+    for (int j = 0; j < seenCount; j++) {
+      if (seen[j] == ssid) { dup = true; break; }
+    }
+    if (dup) continue;
+    if (seenCount < kMaxOpt) seen[seenCount++] = ssid;
+
+    String esc;
+    esc.reserve(ssid.length() + 8);
+    for (size_t k = 0; k < ssid.length(); k++) {
+      char c = ssid[k];
+      if (c == '&') esc += F("&amp;");
+      else if (c == '<') esc += F("&lt;");
+      else if (c == '>') esc += F("&gt;");
+      else if (c == '"') esc += F("&quot;");
+      else esc += c;
+    }
+    bool sel = (wifiSsid.length() && wifiSsid == ssid);
+    options += F("<option value=\"");
+    options += esc;
+    options += F("\"");
+    if (sel) options += F(" selected");
+    options += F(">");
+    options += esc;
+    options += F("  (ch");
+    options += String(WiFi.channel(i));
+    options += F(", ");
+    options += String(WiFi.RSSI(i));
+    options += F("dBm)</option>");
+    listed++;
+  }
+  options += F("<option value=\"__manual__\">手动输入其他名称...</option>");
+  WiFi.scanDelete();
+
+  if (restoreApOnly) {
+    WiFi.mode(WIFI_AP);
+  }
+
+  String page;
+  page.reserve(1800 + options.length());
+  page += F(
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>主机 WiFi 配置</title>"
+    "<style>"
+    "body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;padding:16px;}"
+    "select,input{padding:8px;width:100%;max-width:360px;box-sizing:border-box;}"
+    "button{padding:8px 18px;margin-top:12px;}"
+    ".hint{color:#666;font-size:14px;}"
+    "</style></head><body>"
+    "<h2>主机 (LED 主控) WiFi 配置</h2>"
+    "<p><a href=\"/\">返回首页（状态与串口日志）</a> · <a href=\"/config\">重新扫描</a></p>"
+    "<p class=\"hint\">已扫描到 ");
+  page += String(listed);
+  page += F(" 个可连接热点（共探测 ");
+  page += String(max(n, 0));
+  page += F(" 条）。下拉选择后填密码即可。</p>"
+    "<form method=\"POST\" action=\"/save\">"
+    "<div><label>WiFi 名称：<br/><select name=\"ssid\" id=\"ssidSel\" required>");
+  page += options;
+  page += F(
+    "</select></label></div><br/>"
+    "<div id=\"manualBox\" style=\"display:none\">"
+    "<label>手动输入 SSID：<br/><input name=\"ssid_manual\" id=\"ssidManual\" placeholder=\"输入隐藏或不在列表中的名称\"/></label>"
+    "<br/><br/></div>"
+    "<div><label>密码：<br/><input name=\"pass\" type=\"password\" autocomplete=\"current-password\"/></label></div><br/>"
+    "<button type=\"submit\">保存并重启</button>"
+    "</form>"
+    "<p class=\"hint\">保存后设备会重启并尝试连接。列表没有时选「手动输入」。无a href=\"/config\">重新扫描</a></p>"
+    "<script>"
+    "var sel=document.getElementById('ssidSel');"
+    "var box=document.getElementById('manualBox');"
+    "function sync(){var m=sel.value==='__manual__';box.style.display=m?'block':'none';"
+    "document.getElementById('ssidManual').required=m;}"
+    "sel.addEventListener('change',sync);sync();"
+    "</script>"
+    "</body></html>");
   configServer.send(200, "text/html", page);
 }
 
 void handleConfigSave() {
   String ssid = configServer.arg("ssid");
   String pass = configServer.arg("pass");
+  if (ssid == "__manual__") {
+    ssid = configServer.arg("ssid_manual");
+  }
+  ssid.trim();
   if (ssid.length() == 0) {
     configServer.send(400, "text/plain", "SSID 不能为空");
     return;
@@ -977,8 +1222,8 @@ void handleStatusPage() {
   page += "<style>body{font-family:-apple-system,sans-serif;padding:16px;} code{background:#f5f5f5;padding:2px 4px;} ";
   page += ".log{background:#1e1e1e;color:#d4d4d4;padding:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;}</style></head><body>";
   page += "<h2>主机 (LED 主控) 运行状态</h2>";
-  page += "<p><small>默认首页（<code>/</code>）即本页，含下方串口日志；串口 <code>debug on/off</code>；<b>GPIO7</b> 按住 <b>2～5 秒</b>松开切换 OLED 调试（运行中：首行速度+下方日志；未运行：全屏日志）；<b>按住满 5 秒</b>强制离线并重启。常规屏：多页滚动状态（约 4 秒翻页）。</small></p>";
-  page += "<p><small><b>详细日志（默认关）</b>：串口/网页里「已识别」「已回传」「[ESP-NOW] 收到」等会刷屏；<b>GPIO7 连续短按 3 次</b>（约 0.9s 内）切换，关闭后仅保留「收到开关A/B 按下」等按键日志。也可用串口 <code>verbose on</code>/<code>verbose off</code>。</small></p>";
+  page += "<p><small>默认首页（<code>/</code>）即本页，含下方串口日志；串口 <code>debug on/off</code>；<b>GPIO6</b> 按住 <b>2～5 秒</b>松开切换 OLED 调试（运行中：首行速度+下方日志；未运行：全屏日志）；<b>按住满 5 秒</b>强制离线并重启。常规屏：多页滚动状态（约 4 秒翻页）。</small></p>";
+  page += "<p><small><b>详细日志（默认关）</b>：串口/网页里「已识别」「已回传」「[ESP-NOW] 收到」等会刷屏；<b>GPIO6 连续短按 3 次</b>（约 0.9s 内）切换，关闭后仅保留「收到开关A/B 按下」等按键日志。也可用串口 <code>verbose on</code>/<code>verbose off</code>。</small></p>";
   page += "<p><b>主机名</b>：<code>" + String(hostname) + "</code></p>";
   page += "<p><b>WiFi 已连接</b>：" + String(wifiConnected ? "是" : "否") + "</p>";
   page += "<p><b>当前 SSID</b>：<code>" + (wifiSsid.length() ? wifiSsid : String("-")) + "</code></p>";
@@ -1006,7 +1251,7 @@ void handleStatusPage() {
     page += "</p>";
   }
   page += "<p><b>LED 数量</b>：" + String(NUM_LEDS) + "，亮度 " + String(FastLED.getBrightness()) + "</p>";
-  page += "<p><b>游戏速度</b>：" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（30=最快，1=最慢，默认15；GPIO8 +1 / GPIO9 -1）</p>";
+  page += "<p><b>游戏速度</b>：" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（30=最快，1=最慢，默认15；GPIO7 +1 / GPIO8 -1）</p>";
   page += "<p><b>OLED 调试</b>：" + String(oledSerialMirrorMode ? "开（屏仅日志）" : "关（屏常规）") + "</p>";
   page += "<p><b>详细开关日志</b>：" + String(verboseSwitchLog ? "开（已识别/回传/[ESP-NOW]收包等会显示）" : "关（默认，仅按键日志）") + "</p>";
   page += "<p><b>电脑出点间隔</b>：" + String(computerSpawnIntervalMs) + " ms（由速度档位映射）</p>";
@@ -1065,7 +1310,7 @@ void loop() {
     Serial.println("ms");
     Serial.println("LED should be ON now!");
     Serial.print("Mode: ");
-    Serial.println(currentMode == TEST_ALL_ON ? "ALL ON" : "ONE BY ONE");
+    Serial.println(currentMode == TEST_ALL_ON ? "ALL ON" : currentMode == TEST_ONE_BY_ONE ? "ONE BY ONE" : "GAME");
     Serial.println("========================================");
     firstLoop = false;
   }
@@ -1087,7 +1332,7 @@ void loop() {
   unsigned long currentTime = millis();
   flushDelayedCopies(currentTime);
 
-  // GPIO7：双短按→SET 重置游戏；三连击→详细日志；按住 2s～5s→OLED 调试；满 5s→强制离线重启
+  // GPIO6：双短按→SET 重置游戏；三连击→详细日志；按住 2s～5s→OLED 调试；满 5s→强制离线重启
   static bool forceRawPrev = false;
   static unsigned long forcePressStart = 0;
   static bool forceHandled = false;
@@ -1103,7 +1348,7 @@ void loop() {
     forceHandled = true;
     bool next = !forceOfflineBySwitch;
     saveForceOfflineConfig(next);
-    addLog(String("GPIO7 长按5s：强制离线已") + (next ? "启用" : "关闭") + "，即将重启");
+    addLog(String("GPIO6 长按5s：强制离线已") + (next ? "启用" : "关闭") + "，即将重启");
     delay(200);
     ESP.restart();
   }
@@ -1129,7 +1374,7 @@ void loop() {
       }
     } else if (dur >= OLED_DEBUG_HOLD_MIN_MS && dur < FORCE_OFFLINE_HOLD_MS && !forceHandled) {
       oledSerialMirrorMode = !oledSerialMirrorMode;
-      addLog(String("GPIO7 长按2~5s：OLED调试 ") + (oledSerialMirrorMode ? "开" : "关"));
+      addLog(String("GPIO6 长按2~5s：OLED调试 ") + (oledSerialMirrorMode ? "开" : "关"));
 #if BUZZER_ENABLE
       buzzerSpeedFeedback();
 #endif
@@ -1141,14 +1386,14 @@ void loop() {
   }
   forceRawPrev = forceRaw;
 
-  // GPIO7 双短按 SET：0.9s 内无第 3 击则重置游戏（第 3 击留给详细日志）
+  // GPIO6 双短按 SET：0.9s 内无第 3 击则重置游戏（第 3 击留给详细日志）
   if (gpio7SetArmMs != 0 && gpio7TapCount == 2 && (currentTime - gpio7SetArmMs) >= GPIO7_TAP_WINDOW_MS) {
     hostResetGame();
     gpio7TapCount = 0;
     gpio7SetArmMs = 0;
   }
 
-  // GPIO8/9 调整游戏速度档位 1～30（每次 ±1；30 最快，1 最慢；默认 15）
+  // GPIO7/8 调整游戏速度档位 1～30（每次 ±1；30 最快，1 最慢；默认 15）
   static bool upPrev = false;
   static bool downPrev = false;
   bool upRaw = (digitalRead(GAME_SPEED_UP_GPIO) == LOW);
@@ -1157,7 +1402,7 @@ void loop() {
     if (gameSpeedLevel < GAME_SPEED_LEVEL_MAX) {
       gameSpeedLevel++;
       syncSpawnIntervalFromSpeed();
-      addLog("GPIO8 加速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "，出点间隔=" + String(computerSpawnIntervalMs) + "ms");
+      addLog("GPIO7 加速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "，出点间隔=" + String(computerSpawnIntervalMs) + "ms");
 #if OLED_ENABLE
       refreshOledScreen();
 #endif
@@ -1168,7 +1413,7 @@ void loop() {
     if (gameSpeedLevel > GAME_SPEED_LEVEL_MIN) {
       gameSpeedLevel--;
       syncSpawnIntervalFromSpeed();
-      addLog("GPIO9 减速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "，出点间隔=" + String(computerSpawnIntervalMs) + "ms");
+      addLog("GPIO8 减速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "，出点间隔=" + String(computerSpawnIntervalMs) + "ms");
 #if OLED_ENABLE
       refreshOledScreen();
 #endif
@@ -1349,18 +1594,23 @@ void loop() {
     }
   }
 
-  // 显示：搜索中=蓝呼吸，就绪未开始=彩色流水，就绪且游戏已开始=testGame
-  if (connectionState == CONN_WAITING_A) {
+  // 显示：串口 1/2 测试灯效优先；3=游戏（搜索中蓝呼吸 / 就绪流水 / 对战画面）
+  if (currentMode == TEST_ALL_ON) {
+    testAllOn();
+  } else if (currentMode == TEST_ONE_BY_ONE) {
+    testOneByOne();
+  } else if (connectionState == CONN_WAITING_A) {
     testWaitingForA();
+  } else if (currentMode == TEST_GAME) {
+    g_game.tick(currentTime, connectionState == CONN_READY, true, switchAMacValid, switchBMacValid, bridgeSendA, bridgeSendB);
+    testGame();
   } else {
-    if (currentMode == TEST_GAME) {
-      g_game.tick(currentTime, connectionState == CONN_READY, true, switchAMacValid, switchBMacValid, bridgeSendA, bridgeSendB);
-      testGame();
-    } else
-      testReadyStrip();
+    testReadyStrip();
   }
 
-  unsigned long ledInterval = (connectionState != CONN_WAITING_A && currentMode == TEST_GAME) ? 33UL : 100UL;
+  // AP 配网期降频刷灯（阻塞驱动会挤掉 SoftAP 信标）；STA 正常刷
+  unsigned long ledInterval = wifiApMode ? 2000UL
+      : ((connectionState != CONN_WAITING_A && currentMode == TEST_GAME) ? 33UL : 100UL);
   if (currentTime - lastUpdate >= ledInterval) {
     FastLED.show();
     lastUpdate = currentTime;
@@ -1424,7 +1674,7 @@ void processCommand(String cmd) {
       hostResetGame();
       addLog("开关双击 RST：游戏已重置");
     } else {
-      addLogVerbose("忽略 RST：对战进行中；结果出来后双击可重置，或主机 GPIO7 双短按 SET");
+      addLogVerbose("忽略 RST：对战进行中；结果出来后双击可重置，或主机 GPIO6 双短按 SET");
     }
   } else if (cmd == "a") {
     lastSwitchPressed = 'A';
@@ -1449,6 +1699,13 @@ void processCommand(String cmd) {
     } else {
       Serial.println("亮度值必须在0-255之间");
     }
+#if AMP_TEST_ENABLE
+  } else if (cmd == "amp" || cmd == "i2s") {
+    playAmpTestTone(false);
+  } else if (cmd == "ampswap" || cmd == "amp swap") {
+    // 不改焊线：软件把 BCLK/LRC 对调，若这就有声说明硬件两根接反了
+    playAmpTestTone(true);
+#endif
   } else if (cmd == "espnow" || cmd == "espnow on") {
     espNowDebug = true;
     Serial.println("ESP-NOW 调试已开：收到的包会打印 raw len+hex，用于验证 B 是否发到主机");
@@ -1553,23 +1810,26 @@ void testAllOn() {
   fill_solid(leds, NUM_LEDS, CRGB::White);
 }
 
-// 测试2：逐个点亮（彩虹色）
+// 测试2：逐个点亮（彩虹色，非阻塞，避免 delay 卡死 WiFi/ESP-NOW）
 void testOneByOne() {
-  // 清空所有LED
-  FastLED.clear();
-  
-  // 点亮当前LED，使用彩虹色
-  uint8_t hue = map(currentLed, 0, NUM_LEDS, 0, 255);
-  leds[currentLed] = CHSV(hue, 255, 255);
-  
-  // 移动到下一个LED
+  static unsigned long nextStepMs = 0;
+  unsigned long now = millis();
+  if (now < nextStepMs) return;
+
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  int span = NUM_LEDS > 1 ? (NUM_LEDS - 1) : 1;
+  uint8_t hue = map(currentLed, 0, span, 0, 255);
+  if (currentLed >= 0 && currentLed < NUM_LEDS) {
+    leds[currentLed] = CHSV(hue, 255, 255);
+  }
+
   currentLed++;
   if (currentLed >= NUM_LEDS) {
     currentLed = 0;
-    delay(500); // 循环完成后稍作停顿
+    nextStepMs = now + 500;  // 整圈结束后停顿
+  } else {
+    nextStepMs = now + 20;
   }
-  
-  delay(20); // 每个LED之间的延迟
 }
 
 // 旧颜色回传玩法已弃用（改为 Dot + 状态机玩法）

@@ -10,7 +10,7 @@ build:
 # USB 上传
 upload:
 	@echo "=== USB 上传 ==="
-	pio run -t upload
+	pio run -e esp32-c3-devkitm-1 -t upload
 
 # 智能上传：先 USB，失败再 OTA
 smart-upload:

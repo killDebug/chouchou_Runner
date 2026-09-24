@@ -563,41 +563,112 @@ void setupOTA() {
 }
 
 void handleConfigRoot() {
-  String page = R"(
-<!DOCTYPE html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <title>SwitchA WiFi 配置</title>
-    <style>
-      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 16px; }
-      input { padding: 6px 8px; width: 260px; max-width: 100%; }
-      button { padding: 6px 18px; margin-top: 12px; }
-    </style>
-  </head>
-  <body>
-    <h2>SwitchA WiFi 配置</h2>
-    <form method="POST" action="/save">
-      <div>
-        <label>SSID：<br/><input name="ssid" /></label>
-      </div>
-      <br/>
-      <div>
-        <label>密码：<br/><input name="pass" type="password" /></label>
-      </div>
-      <br/>
-      <button type="submit">保存并重启</button>
-    </form>
-    <p>保存后设备会重启并尝试连接新 WiFi。</p>
-  </body>
-</html>
-)";
+  wifi_mode_t modeBefore = WiFi.getMode();
+  bool restoreApOnly = (modeBefore == WIFI_MODE_AP);
+  if (restoreApOnly) {
+    WiFi.mode(WIFI_AP_STA);
+    delay(50);
+  }
+
+  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+  String options;
+  options.reserve((size_t)max(n, 0) * 96 + 128);
+  options += F("<option value=\"\">-- 请选择附近 WiFi --</option>");
+
+  const int kMaxOpt = 30;
+  String seen[kMaxOpt];
+  int seenCount = 0;
+  int listed = 0;
+  for (int i = 0; i < n && listed < kMaxOpt; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    bool dup = false;
+    for (int j = 0; j < seenCount; j++) {
+      if (seen[j] == ssid) { dup = true; break; }
+    }
+    if (dup) continue;
+    if (seenCount < kMaxOpt) seen[seenCount++] = ssid;
+
+    String esc;
+    esc.reserve(ssid.length() + 8);
+    for (size_t k = 0; k < ssid.length(); k++) {
+      char c = ssid[k];
+      if (c == '&') esc += F("&amp;");
+      else if (c == '<') esc += F("&lt;");
+      else if (c == '>') esc += F("&gt;");
+      else if (c == '"') esc += F("&quot;");
+      else esc += c;
+    }
+    bool sel = (wifiSsid.length() && wifiSsid == ssid);
+    options += F("<option value=\"");
+    options += esc;
+    options += F("\"");
+    if (sel) options += F(" selected");
+    options += F(">");
+    options += esc;
+    options += F("  (ch");
+    options += String(WiFi.channel(i));
+    options += F(", ");
+    options += String(WiFi.RSSI(i));
+    options += F("dBm)</option>");
+    listed++;
+  }
+  options += F("<option value=\"__manual__\">手动输入其他名称...</option>");
+  WiFi.scanDelete();
+
+  if (restoreApOnly) {
+    WiFi.mode(WIFI_AP);
+  }
+
+  String page;
+  page.reserve(1800 + options.length());
+  page += F(
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>SwitchA WiFi 配置</title>"
+    "<style>"
+    "body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif;padding:16px;}"
+    "select,input{padding:8px;width:100%;max-width:360px;box-sizing:border-box;}"
+    "button{padding:8px 18px;margin-top:12px;}"
+    ".hint{color:#666;font-size:14px;}"
+    "</style></head><body>"
+    "<h2>SwitchA WiFi 配置</h2>"
+    "<p><a href=\"/\">重新扫描</a> · <a href=\"/status\">状态</a></p>"
+    "<p class=\"hint\">已扫描到 ");
+  page += String(listed);
+  page += F(" 个可连接热点（共探测 ");
+  page += String(max(n, 0));
+  page += F(" 条）。下拉选择后填密码即可。</p>"
+    "<form method=\"POST\" action=\"/save\">"
+    "<div><label>WiFi 名称：<br/><select name=\"ssid\" id=\"ssidSel\" required>");
+  page += options;
+  page += F(
+    "</select></label></div><br/>"
+    "<div id=\"manualBox\" style=\"display:none\">"
+    "<label>手动输入 SSID：<br/><input name=\"ssid_manual\" id=\"ssidManual\" placeholder=\"输入隐藏或不在列表中的名称\"/></label>"
+    "<br/><br/></div>"
+    "<div><label>密码：<br/><input name=\"pass\" type=\"password\" autocomplete=\"current-password\"/></label></div><br/>"
+    "<button type=\"submit\">保存并重启</button>"
+    "</form>"
+    "<p class=\"hint\">保存后设备会重启并尝试连接。列表没有时选「手动输入」。</p>"
+    "<script>"
+    "var sel=document.getElementById('ssidSel');"
+    "var box=document.getElementById('manualBox');"
+    "function sync(){var m=sel.value==='__manual__';box.style.display=m?'block':'none';"
+    "document.getElementById('ssidManual').required=m;}"
+    "sel.addEventListener('change',sync);sync();"
+    "</script>"
+    "</body></html>");
   configServer.send(200, "text/html", page);
 }
 
 void handleConfigSave() {
   String ssid = configServer.arg("ssid");
   String pass = configServer.arg("pass");
+  if (ssid == "__manual__") {
+    ssid = configServer.arg("ssid_manual");
+  }
+  ssid.trim();
   if (ssid.length() == 0) {
     configServer.send(400, "text/plain", "SSID 不能为空");
     return;

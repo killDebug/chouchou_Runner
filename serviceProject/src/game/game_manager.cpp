@@ -394,7 +394,7 @@ void GameManager::renderStrip(CRGB* leds, int numLeds, unsigned long now, bool c
   }
 
   if (state_ == GameState::RUNNING) {
-    memset(leds, 0, sizeof(CRGB) * (size_t)numLeds);
+    memset(static_cast<void*>(leds), 0, sizeof(CRGB) * (size_t)numLeds);
     for (int i = 0; i < kMaxDots; i++) {
       if (!dots_[i].active) continue;
       int p = dots_[i].position;
