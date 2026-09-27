@@ -26,7 +26,7 @@
 const char* defaultSsid     = "CMCC-tpXT";   // 可作为初始默认值（没有配置且能连上时）
 const char* defaultPassword = "rw6s6we7";
 const char* hostname = "ESP32-C3-SwitchA";
-const char* hostEspNowInfoUrl = "http://ESP32-C3-LED.local/espnow-info";
+const char* hostEspNowInfoUrl = "http://ESP32-S3-LED.local/espnow-info";
 const bool ENABLE_OFFLINE_MODE = true;  // 离线模式开关：无网时保持 ESP-NOW 可用
 String cachedHostIp;
 
@@ -129,7 +129,8 @@ unsigned long lastButtonChangeTime = 0;
 bool espNowReady = false;
 uint8_t espNowChannel = 0;  // 当前 WiFi/ESP-NOW 信道，状态页显示便于与主机、B 对比
 wifi_interface_t espNowIfidx = WIFI_IF_STA;
-uint8_t espNowPeerChannel = 0;  // 在线=0(当前STA信道)，离线=1(AP信道)
+uint8_t espNowPeerChannel = 0;  // 在线=0(当前STA信道)，离线=AP 信道
+uint8_t apChannelInUse = 1;     // AP 热点信道：默认 1，对齐主机失败时跟随主机信道
 bool hostAlignAlert = false;         // 主机信息连续获取失败时置 true，灯环红闪告警
 uint8_t hostAlignFailStreak = 0;     // 连续失败次数
 unsigned long hostAlignLastTryMs = 0;
@@ -162,7 +163,7 @@ volatile unsigned long badPressShowTime = 0;
 
 void setupWiFi();
 void loadWifiConfig();
-void startConfigAP();
+void startConfigAP(uint8_t apChannel = 1);
 void setupOTA();
 void setupEspNow();
 void sendCommand(const char* cmd);
@@ -191,13 +192,26 @@ void ensureHostPeer();
 /** 提升 ESP-NOW 链路质量（解决“稍远/轻微遮挡就丢包”）：关 STA 省电、发射功率拉满、
  *  可选 802.11 LR 长距离协议。注意：LR 必须三端（主机+A+B）同时开启/关闭 */
 #define ENABLE_ESPNOW_LR 1
+/** STA 的 LR 必须在 WiFi.begin 之前设置，连上后再改协议会被路由器踢下线（ASSOC_LEAVE） */
+static void applyStaProtocolBeforeConnect() {
+#if ENABLE_ESPNOW_LR
+  esp_wifi_set_protocol(WIFI_IF_STA, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+#endif
+}
+
 static void boostRadioForEspNow() {
   esp_wifi_set_ps(WIFI_PS_NONE);   // modem sleep 是 ESP-NOW 近距丢包主因之一
   esp_wifi_set_max_tx_power(84);   // 上限由 IDF 按地区自动钳制
 #if ENABLE_ESPNOW_LR
-  wifi_interface_t ifx = wifiConnected ? WIFI_IF_STA : WIFI_IF_AP;
-  esp_wifi_set_protocol(ifx, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
-  addLog("射频：已关省电+满功率+LR 长距离模式");
+  if (wifiConnected) {
+    addLog("射频：已关省电+满功率+LR 长距离模式（LR 已在连网前设置）");
+  } else {
+    // AP 配网热点带 LR 时多数手机扫不到，与主机 AP 分支一致只用 11B/G/N
+    esp_wifi_set_protocol(WIFI_IF_AP, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    // C3 SuperMini 板载天线在满功率下热点常发不出去，配网时降到 8.5dBm
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    addLog("射频：已关省电+8.5dBm（AP 热点不开 LR）");
+  }
 #else
   addLog("射频：已关省电+满功率");
 #endif
@@ -250,7 +264,9 @@ void loadWifiConfig() {
   wifiHasConfig = wifiSsid.length() > 0;
 }
 
-void startConfigAP() {
+void startConfigAP(uint8_t apChannel) {
+  if (apChannel < 1 || apChannel > 13) apChannel = 1;
+  apChannelInUse = apChannel;
   wifiApMode = true;
   wifiConnected = false;
   mdnsReady = false;
@@ -259,7 +275,7 @@ void startConfigAP() {
   WiFi.mode(WIFI_AP);
   const char* apSsid = "SwitchA-Setup";
   const char* apPass = "setup1234";   // 至少 8 位，用 10 位减少兼容性问题
-  WiFi.softAP(apSsid, apPass, 1);     // channel 1，提高兼容性
+  WiFi.softAP(apSsid, apPass, apChannelInUse);
   IPAddress apIP = WiFi.softAPIP();
 
   addLog("进入 WiFi 配网模式 (AP)");
@@ -296,6 +312,10 @@ void setupWiFi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
+  // 同名多路由器时扫全信道、连信号最强的，避免快速扫描先撞上够不着的那台
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+  applyStaProtocolBeforeConnect();
   WiFi.begin(trySsid.c_str(), tryPass.c_str());
 
   unsigned long start = millis();
@@ -462,6 +482,7 @@ void alignToHostApIfNeeded() {
   WiFi.disconnect(false, true);
   delay(120);
   WiFi.mode(WIFI_STA);
+  applyStaProtocolBeforeConnect();
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str(), hostCh, hostBssidMac, true);
 
   unsigned long start = millis();
@@ -474,9 +495,16 @@ void alignToHostApIfNeeded() {
     addLog("对齐成功，当前 BSSID: " + WiFi.BSSIDstr());
     rebindNetworkServices();
   } else {
-    wifiConnected = false;
-    addLog("对齐失败，保持当前连接流程");
-    setupWiFi();
+    // 主机所在路由器够不着：改为在主机信道开离线热点，ESP-NOW 与主机同信道仍可对战
+    addLog("连不上主机所在 AP，改用离线直连（信道 " + String((int)hostCh) + "）");
+    WiFi.disconnect(false, true);
+    startConfigAP(hostCh);
+    if (espNowReady) {
+      esp_now_deinit();
+      espNowReady = false;
+      boostRadioForEspNow();
+      setupEspNow();
+    }
   }
 }
 
@@ -873,7 +901,7 @@ void setupEspNow() {
     return;
   }
   espNowIfidx = wifiConnected ? WIFI_IF_STA : WIFI_IF_AP;
-  espNowPeerChannel = wifiConnected ? 0 : 1;
+  espNowPeerChannel = wifiConnected ? 0 : apChannelInUse;
 
   if (esp_now_init() != ESP_OK) {
     addLog("ESP-NOW 初始化失败");

@@ -13,6 +13,7 @@
 #include <driver/i2s.h>
 #include <math.h>
 #include "game/game_manager.h"
+#include "audio/boot_assets.h"
 
 // WS2812B配置（ESP32-S3 N8R8：信号脚 GPIO4→12 连续，见 引脚迁移.md）
 #define LED_PIN 2          // 灯带 DIN → GPIO2（单独 XH-2）
@@ -37,6 +38,11 @@ String wifiSsid;
 String wifiPassword;
 bool wifiHasConfig   = false;
 bool wifiConnected   = false;
+/** 开机走的是 STA（连家用 WiFi）；loop 据此实时刷新 wifiConnected 并自动重连 */
+bool wifiStaMode     = false;
+/** 事件回调里只记原因，日志在 loop 里打（addLog 非线程安全） */
+static volatile uint8_t wifiLastDisconnectReason = 0;
+static volatile uint32_t wifiDisconnectCount = 0;
 bool wifiApMode      = false;
 bool httpServerStarted = false;
 
@@ -57,10 +63,10 @@ const bool ENABLE_FORCE_OFFLINE_SWITCH = true;
 const int FORCE_OFFLINE_SWITCH_GPIO = 6;
 const int GAME_SPEED_UP_GPIO = 7;
 const int GAME_SPEED_DOWN_GPIO = 8;
-const unsigned long FORCE_OFFLINE_HOLD_MS = 5000UL;
-/** GPIO6 按住 2s～5s 内松开：切换 OLED 调试（与满 5s 强制离线区分） */
+const unsigned long FORCE_OFFLINE_HOLD_MS = 5000UL;  // 保留常量供别处对照；菜单外不再用长按强制离线
+/** GPIO6 按住 ≥2s 松开：进入/退出设置菜单（功能都在菜单里，不再叠按） */
 const unsigned long OLED_DEBUG_HOLD_MIN_MS = 2000UL;
-/** GPIO6 三连击（短按）：开关「详细串口/日志」（已识别/回传/收包等）；默认关，仅保留 A/B 按键日志 */
+/** 设置菜单内：双击进入/确认，单击超时返回 */
 const unsigned long GPIO7_TAP_WINDOW_MS = 900UL;
 const unsigned long GPIO7_SHORT_PRESS_MAX_MS = 420UL;
 // 电脑出点间隔（毫秒）：由速度档位 1～30 映射，30=最快，1=最慢
@@ -92,9 +98,11 @@ static int intervalMsFromSpeedLevel(int level) {
 #define BUZZER_ENABLE       1
 #define BUZZER_PIN          9
 
-// ---------- MAX98357 I2S 功放测试：BCLK=10 / LRC=11 / DIN=12（SD 接 Vin）----------
+// ---------- MAX98357 I2S 功放：BCLK=10 / LRC=11 / DIN=12（SD 接 Vin）----------
 // 手册支持的 LRCLK：8/16/32/44.1/48/88.2/96 kHz —— 禁止 22.05k（无声）
+// 开机欢迎：蜂鸣器三声后播 chime + 人声；串口 amp/ampswap 仍可播正弦自检
 #define AMP_TEST_ENABLE     1
+#define BOOT_VOICE_ENABLE   1
 #define I2S_BCLK_PIN        10
 #define I2S_LRC_PIN         11
 #define I2S_DOUT_PIN        12
@@ -102,10 +110,16 @@ static int intervalMsFromSpeedLevel(int level) {
 #define AMP_SAMPLE_RATE     16000
 #define AMP_TONE_AMPLITUDE  30000
 #define AMP_BUFFER_FRAMES   256
+/** 喇叭软件音量 20～100（%，步进 10）；NVS 持久化；设置菜单 / 串口 vol 调节 */
+#define AMP_VOLUME_MIN      20
+#define AMP_VOLUME_MAX      100
+#define AMP_VOLUME_STEP     10
+#define AMP_VOLUME_DEFAULT  80
 
 #if OLED_ENABLE
 // 全缓冲 + 文泉驿 12px 中文，避免 Adafruit 默认字库中文乱码
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
+// U8G2_R2 = 180° 旋转（屏装反/上下颠倒时用；正装改回 U8G2_R0）
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE, OLED_SCL, OLED_SDA);
 bool oledOk = false;
 #endif
 
@@ -189,8 +203,39 @@ const int moveIntervalMs = 50;
 // 游戏速度档位：1=最慢，30=最快，默认 15；GPIO7 +1，GPIO8 -1，每次 ±1
 int gameSpeedLevel = GAME_SPEED_LEVEL_DEFAULT;
 int computerSpawnIntervalMs = intervalMsFromSpeedLevel(GAME_SPEED_LEVEL_DEFAULT);  // 与 gameSpeedLevel 同步
-/** 调试模式：游戏运行中首行 Spd + 下方日志；未运行时全屏日志。GPIO6 长按 2～5s 松开切换 */
+/** 调试模式：游戏运行中首行 Spd + 下方日志；未运行时全屏日志（设置菜单里开关） */
 bool oledSerialMirrorMode = false;
+/** 调速时 OLED 全屏大字只显速度，到期后恢复多页轮播（避免翻页看不到） */
+static unsigned long oledSpeedFocusUntilMs = 0;
+static const unsigned long OLED_SPEED_FOCUS_MS = 2500UL;
+/** 调音量时 OLED 全屏只显音量（快捷反馈；正式调节在设置菜单） */
+static unsigned long oledVolumeFocusUntilMs = 0;
+static const unsigned long OLED_VOLUME_FOCUS_MS = 2500UL;
+/** 喇叭软件音量（%），播 PCM/测试音时乘上去；NVS 键 ampvol */
+int ampVolumePercent = AMP_VOLUME_DEFAULT;
+
+// ---------- 主机设置菜单（手机式：长按进菜单，加减选择，双击进入）----------
+enum HostSettingsUi : uint8_t {
+  HSET_OFF = 0,
+  HSET_LIST,
+  HSET_EDIT_VOL,
+  HSET_EDIT_SPD,
+  HSET_WIFI_CONFIRM,
+};
+enum HostSettingsItem : uint8_t {
+  HSI_VOL = 0,
+  HSI_SPD,
+  HSI_WIFI,
+  HSI_RESET,
+  HSI_OLED_DBG,
+  HSI_VERBOSE,
+  HSI_EXIT,
+  HSI_COUNT
+};
+static HostSettingsUi hostSettingsUi = HSET_OFF;
+static int hostSettingsCursor = 0;
+static int hostSettingsWifiYes = 1;  // WiFi 确认页：1=执行 0=取消
+static bool hostSettingsActive() { return hostSettingsUi != HSET_OFF; }
 /** 详细开关/ESP-NOW 日志：GPIO6 三连击切换；关时串口与网页日志不刷屏，仅保留 A/B 按键相关 */
 bool verboseSwitchLog = false;
 
@@ -241,6 +286,10 @@ void testWaitingForA();  // 搜索中：蓝呼吸
 void testReadyStrip();   // 双开关就绪：彩色流水灯
 void loadHostConfig();
 void saveForceOfflineConfig(bool enabled);
+void saveAmpVolumeConfig(int percent);
+void saveGameSpeedConfig(int level);
+static int clampAmpVolume(int percent);
+static void applyAmpVolumeToSample(int16_t* s16);
 void sendToSwitchA(const uint8_t* data, size_t len);
 void sendToSwitchB(const uint8_t* data, size_t len);
 void sendColToBothSwitches();
@@ -257,6 +306,8 @@ static void syncSpawnIntervalFromSpeed();
 #if AMP_TEST_ENABLE
 static bool setupAmpI2s(bool swapBclkLrc);
 void playAmpTestTone(bool swapBclkLrc = false);
+void playBootWelcome();
+static void playPcmMonoS16(const int16_t* pcm, size_t samples, uint16_t srcRate);
 #endif
 
 #if AMP_TEST_ENABLE
@@ -360,6 +411,7 @@ void playAmpTestTone(bool swapBclkLrc) {
       int n = framesLeft < AMP_BUFFER_FRAMES ? framesLeft : AMP_BUFFER_FRAMES;
       for (int i = 0; i < n; i++) {
         int16_t s16 = (int16_t)(sinf(phase) * (float)AMP_TONE_AMPLITUDE);
+        applyAmpVolumeToSample(&s16);
         int32_t s32 = ((int32_t)s16) << 16;
         samples[2 * i] = s32;
         samples[2 * i + 1] = s32;
@@ -390,6 +442,69 @@ void playAmpTestTone(bool swapBclkLrc) {
   i2s_zero_dma_buffer(I2S_PORT_NUM);
   Serial.printf("MAX98357：结束 bytes=%u\n", (unsigned)totalWritten);
   addLog(String("功放测试结束 ") + String((unsigned)totalWritten));
+}
+
+/** 播单声道 s16le PCM；I2S 固定 16k。若 srcRate=8k 则每采样重复 2 次。 */
+static void playPcmMonoS16(const int16_t* pcm, size_t samples, uint16_t srcRate) {
+  if (!pcm || samples == 0) return;
+  if (!setupAmpI2s(false)) return;
+
+  const int upsample = (srcRate > 0 && srcRate < AMP_SAMPLE_RATE)
+                           ? (int)(AMP_SAMPLE_RATE / srcRate)
+                           : 1;
+  const int reps = upsample > 0 ? upsample : 1;
+  int32_t samplesOut[AMP_BUFFER_FRAMES * 2];
+  int nFrames = 0;
+
+  for (size_t idx = 0; idx < samples; idx++) {
+    int16_t s16 = pcm[idx];
+    applyAmpVolumeToSample(&s16);
+    int32_t s32 = ((int32_t)s16) << 16;
+    for (int r = 0; r < reps; r++) {
+      samplesOut[2 * nFrames] = s32;
+      samplesOut[2 * nFrames + 1] = s32;
+      nFrames++;
+      if (nFrames >= AMP_BUFFER_FRAMES) {
+        size_t written = 0;
+        esp_err_t err = i2s_write(I2S_PORT_NUM, samplesOut, nFrames * 2 * sizeof(int32_t),
+                                  &written, portMAX_DELAY);
+        if (err != ESP_OK) {
+          Serial.printf("I2S PCM write fail: %s\n", esp_err_to_name(err));
+          addLog(String("I2S PCM 失败: ") + esp_err_to_name(err));
+          return;
+        }
+        nFrames = 0;
+      }
+    }
+  }
+  if (nFrames > 0) {
+    size_t written = 0;
+    esp_err_t err = i2s_write(I2S_PORT_NUM, samplesOut, nFrames * 2 * sizeof(int32_t),
+                              &written, portMAX_DELAY);
+    if (err != ESP_OK) {
+      Serial.printf("I2S PCM write fail: %s\n", esp_err_to_name(err));
+      addLog(String("I2S PCM 失败: ") + esp_err_to_name(err));
+      return;
+    }
+  }
+  delay(40);
+  i2s_zero_dma_buffer(I2S_PORT_NUM);
+}
+
+/** 开机欢迎：随机 chime + 随机无名人声（蜂鸣器三声之后调用） */
+void playBootWelcome() {
+#if BOOT_VOICE_ENABLE
+  if (kBootChimeCount == 0 || kBootVoiceNonameCount == 0) return;
+  const BootPcmClip& chime = kBootChimes[esp_random() % kBootChimeCount];
+  const BootPcmClip& voice = kBootVoicesNoname[esp_random() % kBootVoiceNonameCount];
+  addLog(String("开机欢迎：chime@") + chime.rate + "Hz " + chime.samples + "samp → voice@" +
+         voice.rate + "Hz " + voice.samples + "samp");
+  Serial.println("播放开机欢迎音效 + 语音…");
+  playPcmMonoS16(chime.data, chime.samples, chime.rate);
+  delay(120);
+  playPcmMonoS16(voice.data, voice.samples, voice.rate);
+  addLog("开机欢迎播放完成");
+#endif
 }
 #endif
 
@@ -519,7 +634,7 @@ void setupOled() {
   u8g2.setPowerSave(0);
   u8g2.setContrast(255);
   u8g2.enableUTF8Print();
-  u8g2.setFont(u8g2_font_wqy12_t_chinese1);
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
   u8g2.clearBuffer();
   u8g2.drawUTF8(0, 12, "ESP32-S3 LED Host");
   u8g2.drawUTF8(0, 24, hostname);
@@ -534,7 +649,7 @@ void setupOled() {
 #if OLED_ENABLE
 /** 单行宽度不超过 128 像素（中文约 10～11 字）；异常 UTF-8 时限制循环次数 */
 static String oledFitUtf8Width(const String& s) {
-  u8g2.setFont(u8g2_font_wqy12_t_chinese1);
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
   if (u8g2.getUTF8Width(s.c_str()) <= 128) return s;
   String t = s;
   int guard = (int)t.length() + 24;
@@ -555,7 +670,7 @@ static void oledDrawLinesUtf8(const String* lines, int n) {
   const int lineH = 12;
   int y = 12;
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_wqy12_t_chinese1);
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
   int lim = n < maxLines ? n : maxLines;
   for (int i = 0; i < lim; i++) {
     String t = oledFitUtf8Width(lines[i]);
@@ -574,6 +689,15 @@ static String oledGetLogLineK(int k) {
   return logBuf[j];
 }
 
+/** OLED 状态页固定首行：联网是否成功 */
+static String oledNetStatusLine() {
+  if (forceOfflineBySwitch) return "网络:强制离线";
+  if (wifiConnected) return String("已连 ") + WiFi.localIP().toString();
+  if (wifiApMode) return String("配网 ") + WiFi.softAPIP().toString();
+  if (wifiStaMode) return "网络:断开 重连中";
+  return "网络:未连接";
+}
+
 /** 与网页 /status 同字段；OLED 用 U8g2 中文绘制时按像素截断 */
 static int oledBuildStatusLines(String* out, int maxOut) {
   int n = 0;
@@ -582,7 +706,10 @@ static int oledBuildStatusLines(String* out, int maxOut) {
     out[n++] = s;
   };
   push(String(hostname));
-  push(String("WiFi:") + (wifiConnected ? "STA" : (wifiApMode ? "AP" : "NO")));
+  push(String("WiFi:") + (wifiConnected ? "STA" : (wifiApMode ? "AP" : (wifiStaMode ? "重连中" : "NO"))));
+  if (wifiStaMode && wifiDisconnectCount > 0) {
+    push(String("断线:") + String((unsigned long)wifiDisconnectCount) + " 码" + String((int)wifiLastDisconnectReason));
+  }
   if (wifiConnected) {
     push(String("SSID:") + (WiFi.SSID().length() ? WiFi.SSID() : wifiSsid));
     push(String("IP:") + WiFi.localIP().toString());
@@ -606,11 +733,278 @@ static int oledBuildStatusLines(String* out, int maxOut) {
   }
   push(String("LED:") + String(NUM_LEDS) + " L" + String(FastLED.getBrightness()));
   push(String("Spd:") + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX));
+  push(String("Vol:") + String(ampVolumePercent) + "%");
   push(String("Intv:") + String(computerSpawnIntervalMs) + "ms");
   push(String("Dbg:") + String(oledSerialMirrorMode ? "ON" : "OFF"));
   push(String("Vrb:") + String(verboseSwitchLog ? "ON" : "OFF"));
   return n;
 }
+
+#if OLED_ENABLE
+/** 调速瞬间：全屏加粗大号速度，暂停状态翻页 */
+static void oledArmSpeedFocus() {
+  if (hostSettingsActive()) return;
+  oledSpeedFocusUntilMs = millis() + OLED_SPEED_FOCUS_MS;
+  oledVolumeFocusUntilMs = 0;
+}
+
+static void oledArmVolumeFocus() {
+  if (hostSettingsActive()) return;
+  oledVolumeFocusUntilMs = millis() + OLED_VOLUME_FOCUS_MS;
+  oledSpeedFocusUntilMs = 0;
+}
+
+static void oledDrawSpeedFocus() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 0, OLED_SCREEN_W, OLED_SCREEN_H);
+  u8g2.setDrawColor(0);
+
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+  const char* title = "速度";
+  int tw = u8g2.getUTF8Width(title);
+  u8g2.drawUTF8((OLED_SCREEN_W - tw) / 2, 14, title);
+
+  char num[8];
+  snprintf(num, sizeof(num), "%d", gameSpeedLevel);
+  u8g2.setFont(u8g2_font_logisoso32_tn);
+  int nw = u8g2.getStrWidth(num);
+  u8g2.drawStr((OLED_SCREEN_W - nw) / 2, 50, num);
+
+  char sub[28];
+  snprintf(sub, sizeof(sub), "/%d  %dms", GAME_SPEED_LEVEL_MAX, computerSpawnIntervalMs);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  int sw = u8g2.getStrWidth(sub);
+  u8g2.drawStr((OLED_SCREEN_W - sw) / 2, 62, sub);
+
+  u8g2.setDrawColor(1);
+  u8g2.sendBuffer();
+}
+
+static void oledDrawVolumeFocus() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.drawBox(0, 0, OLED_SCREEN_W, OLED_SCREEN_H);
+  u8g2.setDrawColor(0);
+
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+  const char* title = "音量";
+  int tw = u8g2.getUTF8Width(title);
+  u8g2.drawUTF8((OLED_SCREEN_W - tw) / 2, 14, title);
+
+  char num[8];
+  snprintf(num, sizeof(num), "%d", ampVolumePercent);
+  u8g2.setFont(u8g2_font_logisoso32_tn);
+  int nw = u8g2.getStrWidth(num);
+  u8g2.drawStr((OLED_SCREEN_W - nw) / 2, 50, num);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  const char* sub = "%";
+  int sw = u8g2.getStrWidth(sub);
+  u8g2.drawStr((OLED_SCREEN_W - sw) / 2, 62, sub);
+
+  u8g2.setDrawColor(1);
+  u8g2.sendBuffer();
+}
+
+static const char* hostSettingsItemLabel(int idx) {
+  switch (idx) {
+    case HSI_VOL: return "音量";
+    case HSI_SPD: return "速度";
+    case HSI_WIFI: return "WiFi配网";
+    case HSI_RESET: return "重置游戏";
+    case HSI_OLED_DBG: return "调试屏";
+    case HSI_VERBOSE: return "详细日志";
+    case HSI_EXIT: return "退出";
+    default: return "?";
+  }
+}
+
+static void oledDrawHostSettings() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+
+  if (hostSettingsUi == HSET_EDIT_VOL) {
+    oledDrawVolumeFocus();
+    return;
+  }
+  if (hostSettingsUi == HSET_EDIT_SPD) {
+    oledDrawSpeedFocus();
+    return;
+  }
+  if (hostSettingsUi == HSET_WIFI_CONFIRM) {
+    const char* title = forceOfflineBySwitch ? "关强制离线?" : "开配网热点?";
+    u8g2.drawUTF8(0, 12, title);
+    u8g2.drawUTF8(0, 28, forceOfflineBySwitch ? "将连家用WiFi" : "Service-Setup");
+    String yes = String(hostSettingsWifiYes ? "> " : "  ") + "确定";
+    String no = String(!hostSettingsWifiYes ? "> " : "  ") + "取消";
+    u8g2.drawUTF8(0, 44, yes.c_str());
+    u8g2.drawUTF8(0, 58, no.c_str());
+    u8g2.sendBuffer();
+    return;
+  }
+
+  // 列表：标题 + 4 行可见，光标滚动
+  u8g2.drawUTF8(0, 12, "设置");
+  int top = hostSettingsCursor - 1;
+  if (top < 0) top = 0;
+  if (top > HSI_COUNT - 4) top = HSI_COUNT - 4;
+  if (top < 0) top = 0;
+  for (int row = 0; row < 4; row++) {
+    int idx = top + row;
+    if (idx >= HSI_COUNT) break;
+    char line[40];
+    const char* mark = (idx == hostSettingsCursor) ? ">" : " ";
+    if (idx == HSI_VOL) {
+      snprintf(line, sizeof(line), "%s音量 %d%%", mark, ampVolumePercent);
+    } else if (idx == HSI_SPD) {
+      snprintf(line, sizeof(line), "%s速度 %d/%d", mark, gameSpeedLevel, GAME_SPEED_LEVEL_MAX);
+    } else if (idx == HSI_WIFI) {
+      snprintf(line, sizeof(line), "%sWiFi %s", mark, forceOfflineBySwitch ? "离线" : "正常");
+    } else if (idx == HSI_RESET) {
+      snprintf(line, sizeof(line), "%s重置游戏", mark);
+    } else if (idx == HSI_OLED_DBG) {
+      snprintf(line, sizeof(line), "%s调试屏 %s", mark, oledSerialMirrorMode ? "开" : "关");
+    } else if (idx == HSI_VERBOSE) {
+      snprintf(line, sizeof(line), "%s详细日志 %s", mark, verboseSwitchLog ? "开" : "关");
+    } else {
+      snprintf(line, sizeof(line), "%s%s", mark, hostSettingsItemLabel(idx));
+    }
+    u8g2.drawUTF8(0, 24 + row * 12, line);
+  }
+  u8g2.sendBuffer();
+}
+
+static void hostSettingsEnterMenu() {
+  hostSettingsUi = HSET_LIST;
+  hostSettingsCursor = 0;
+  oledSpeedFocusUntilMs = 0;
+  oledVolumeFocusUntilMs = 0;
+  addLog("进入设置菜单");
+#if BUZZER_ENABLE
+  buzzerSpeedFeedback();
+#endif
+  if (oledOk) refreshOledScreen();
+}
+
+static void hostSettingsExitMenu() {
+  hostSettingsUi = HSET_OFF;
+  addLog("退出设置菜单");
+#if BUZZER_ENABLE
+  buzzerSpeedFeedback();
+#endif
+  if (oledOk) refreshOledScreen();
+}
+
+static void hostSettingsBack() {
+  if (hostSettingsUi == HSET_LIST) {
+    hostSettingsExitMenu();
+    return;
+  }
+  hostSettingsUi = HSET_LIST;
+  if (oledOk) refreshOledScreen();
+}
+
+static void hostSettingsActivate() {
+  if (hostSettingsUi == HSET_LIST) {
+    switch (hostSettingsCursor) {
+      case HSI_VOL:
+        hostSettingsUi = HSET_EDIT_VOL;
+        break;
+      case HSI_SPD:
+        hostSettingsUi = HSET_EDIT_SPD;
+        break;
+      case HSI_WIFI:
+        hostSettingsWifiYes = 1;
+        hostSettingsUi = HSET_WIFI_CONFIRM;
+        break;
+      case HSI_RESET:
+        hostResetGame();
+        addLog("设置菜单：重置游戏");
+#if BUZZER_ENABLE
+        buzzerSpeedFeedback();
+#endif
+        hostSettingsExitMenu();
+        return;
+      case HSI_OLED_DBG:
+        oledSerialMirrorMode = !oledSerialMirrorMode;
+        addLog(String("调试屏:") + (oledSerialMirrorMode ? "开" : "关"));
+#if BUZZER_ENABLE
+        buzzerSpeedFeedback();
+#endif
+        break;
+      case HSI_VERBOSE:
+        verboseSwitchLog = !verboseSwitchLog;
+        addLog(String("详细日志:") + (verboseSwitchLog ? "开" : "关"));
+#if BUZZER_ENABLE
+        buzzerSpeedFeedback();
+#endif
+        break;
+      case HSI_EXIT:
+        hostSettingsExitMenu();
+        return;
+      default:
+        break;
+    }
+  } else if (hostSettingsUi == HSET_EDIT_VOL || hostSettingsUi == HSET_EDIT_SPD) {
+    hostSettingsUi = HSET_LIST;
+  } else if (hostSettingsUi == HSET_WIFI_CONFIRM) {
+    if (hostSettingsWifiYes) {
+      bool next = !forceOfflineBySwitch;
+      saveForceOfflineConfig(next);
+      addLog(String("WiFi:") + (next ? "强制离线/配网" : "恢复正常") + "，即将重启");
+      delay(200);
+      ESP.restart();
+    } else {
+      hostSettingsUi = HSET_LIST;
+    }
+  }
+  if (oledOk) refreshOledScreen();
+}
+
+static void hostSettingsOnUp() {
+  if (hostSettingsUi == HSET_LIST) {
+    if (hostSettingsCursor > 0) hostSettingsCursor--;
+    else hostSettingsCursor = HSI_COUNT - 1;
+  } else if (hostSettingsUi == HSET_EDIT_VOL) {
+    saveAmpVolumeConfig(ampVolumePercent + AMP_VOLUME_STEP);
+    addLog(String("音量=") + ampVolumePercent + "%");
+  } else if (hostSettingsUi == HSET_EDIT_SPD) {
+    if (gameSpeedLevel < GAME_SPEED_LEVEL_MAX) {
+      saveGameSpeedConfig(gameSpeedLevel + 1);
+      addLog(String("速度=") + gameSpeedLevel);
+    }
+  } else if (hostSettingsUi == HSET_WIFI_CONFIRM) {
+    hostSettingsWifiYes = 1;
+  }
+#if BUZZER_ENABLE
+  buzzerSpeedFeedback();
+#endif
+  if (oledOk) refreshOledScreen();
+}
+
+static void hostSettingsOnDown() {
+  if (hostSettingsUi == HSET_LIST) {
+    if (hostSettingsCursor < HSI_COUNT - 1) hostSettingsCursor++;
+    else hostSettingsCursor = 0;
+  } else if (hostSettingsUi == HSET_EDIT_VOL) {
+    saveAmpVolumeConfig(ampVolumePercent - AMP_VOLUME_STEP);
+    addLog(String("音量=") + ampVolumePercent + "%");
+  } else if (hostSettingsUi == HSET_EDIT_SPD) {
+    if (gameSpeedLevel > GAME_SPEED_LEVEL_MIN) {
+      saveGameSpeedConfig(gameSpeedLevel - 1);
+      addLog(String("速度=") + gameSpeedLevel);
+    }
+  } else if (hostSettingsUi == HSET_WIFI_CONFIRM) {
+    hostSettingsWifiYes = 0;
+  }
+#if BUZZER_ENABLE
+  buzzerSpeedFeedback();
+#endif
+  if (oledOk) refreshOledScreen();
+}
+#endif
 
 /** 刷新 OLED：常规=多页滚动状态；调试+运行=首行 Spd+日志；调试+空闲=全屏日志（U8g2 中文） */
 void refreshOledScreen() {
@@ -620,6 +1014,27 @@ void refreshOledScreen() {
   s_inOledRefresh = true;
   const int OLED_PAGE_LINES = 5;
   const int OLED_RUN_LOG_LINES = 4;
+
+  // 设置菜单优先
+  if (hostSettingsActive()) {
+    oledDrawHostSettings();
+    s_inOledRefresh = false;
+    return;
+  }
+
+  // 调音量/调速反馈：打断多页轮播
+  if (oledVolumeFocusUntilMs != 0 && (long)(millis() - oledVolumeFocusUntilMs) < 0) {
+    oledDrawVolumeFocus();
+    s_inOledRefresh = false;
+    return;
+  }
+  oledVolumeFocusUntilMs = 0;
+  if (oledSpeedFocusUntilMs != 0 && (long)(millis() - oledSpeedFocusUntilMs) < 0) {
+    oledDrawSpeedFocus();
+    s_inOledRefresh = false;
+    return;
+  }
+  oledSpeedFocusUntilMs = 0;
 
   if (oledSerialMirrorMode) {
     static GameState oledPrevGameState = GameState::IDLE;
@@ -652,7 +1067,7 @@ void refreshOledScreen() {
       if (logLineCount <= 0) {
         String le[2];
         le[0] = "LOG(empty)";
-        le[1] = "GPIO6 2~5s Dbg";
+        le[1] = "GPIO6 长按开设置";
         oledDrawLinesUtf8(le, 2);
       } else {
         int n = logLineCount < OLED_PAGE_LINES ? logLineCount : OLED_PAGE_LINES;
@@ -674,14 +1089,17 @@ void refreshOledScreen() {
       oledStatPageFlipMs = now;
       oledStatPageIdx++;
     }
+    // 首行固定显示联网状态，其余行翻页
+    const int bodyLines = OLED_PAGE_LINES - 1;
     int total = oledBuildStatusLines(oledStatLines, 40);
-    int numPages = (total + OLED_PAGE_LINES - 1) / OLED_PAGE_LINES;
+    int numPages = (total + bodyLines - 1) / bodyLines;
     if (numPages < 1) numPages = 1;
     uint32_t p = oledStatPageIdx % (uint32_t)numPages;
     String pageLines[5];
-    for (int i = 0; i < OLED_PAGE_LINES; i++) {
-      int idx = (int)p * OLED_PAGE_LINES + i;
-      pageLines[i] = (idx < total) ? oledStatLines[idx] : "";
+    pageLines[0] = oledNetStatusLine();
+    for (int i = 0; i < bodyLines; i++) {
+      int idx = (int)p * bodyLines + i;
+      pageLines[1 + i] = (idx < total) ? oledStatLines[idx] : "";
     }
     oledDrawLinesUtf8(pageLines, OLED_PAGE_LINES);
   }
@@ -719,11 +1137,11 @@ void setup() {
   addLog("=== 主机 (LED 主控) 启动 ===");
   addLog("========================================");
 
-  // 先测功放再蜂鸣，避免 tone/LEDC 抢资源；串口 amp / ampswap 可重播
-#if AMP_TEST_ENABLE
-  playAmpTestTone(false);
-#endif
+  // 开机：先蜂鸣器三声，再喇叭欢迎音效 + 人声；串口 amp/ampswap 仍可测正弦
   playStartupBeep();
+#if AMP_TEST_ENABLE && BOOT_VOICE_ENABLE
+  playBootWelcome();
+#endif
   setupOled();
 
   pinMode(FORCE_OFFLINE_SWITCH_GPIO, INPUT_PULLUP);
@@ -760,9 +1178,7 @@ void setup() {
     esp_wifi_set_max_tx_power(84);
 #if ENABLE_ESPNOW_LR
     if (wifiConnected) {
-      esp_wifi_set_protocol(espNowIfidx,
-                            (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
-      addLog("ESP-NOW：已关省电+满功率+LR（STA）");
+      addLog("ESP-NOW：已关省电+满功率+LR（STA，LR 已在连网前设置）");
     } else {
       esp_wifi_set_protocol(espNowIfidx,
                             (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
@@ -815,9 +1231,12 @@ void setup() {
   Serial.println("无线开关A 发 A、开关B 发 B，主程序可区分；关键消息三连发+主机去重，COL 同步轮次与颜色");
   Serial.println("输入 'brightness <0-255>' - 设置亮度（例如: brightness 100）");
   Serial.println("输入 'status' - 查看当前状态");
-  Serial.println("输入 'debug on/off/debug' - OLED 调试；GPIO6 长按2~5s 同效");
-  Serial.println("输入 'verbose on/off' - 详细开关日志；GPIO6 连按3次短按同效");
+  Serial.println("输入 'vol' / 'vol <20-100>' - 喇叭音量（NVS；也可进设置菜单调）");
+  Serial.println("输入 'debug on/off/debug' - OLED 调试（设置菜单里也可开关）");
+  Serial.println("输入 'verbose on/off' - 详细开关日志（设置菜单里也可开关）");
   Serial.println("输入 'espnow on'|'espnow off' - ESP-NOW 收包 hex 调试");
+  Serial.println("GPIO6 长按≥2s=进出设置；菜单内：加减=上下选、双击=进入、单击=返回");
+  Serial.println("菜单外 GPIO7/8=加速/减速（已保存）；设置里可调音量/速度/WiFi/重置游戏");
   Serial.print("\n当前模式: ");
   printCurrentMode();
   Serial.println("\n程序已启动，LED应该已经点亮！");
@@ -835,8 +1254,15 @@ void loadWifiConfig() {
 void loadHostConfig() {
   hostPrefs.begin("hostcfg", true);
   forceOfflineBySwitch = hostPrefs.getBool("forceoff", false);
+  ampVolumePercent = clampAmpVolume(hostPrefs.getInt("ampvol", AMP_VOLUME_DEFAULT));
+  int spd = hostPrefs.getInt("gamespd", GAME_SPEED_LEVEL_DEFAULT);
+  if (spd < GAME_SPEED_LEVEL_MIN) spd = GAME_SPEED_LEVEL_MIN;
+  if (spd > GAME_SPEED_LEVEL_MAX) spd = GAME_SPEED_LEVEL_MAX;
+  gameSpeedLevel = spd;
   hostPrefs.end();
-  if (forceOfflineBySwitch) addLog("强制离线:已启用（GPIO6 长按5s切换）");
+  syncSpawnIntervalFromSpeed();
+  if (forceOfflineBySwitch) addLog("强制离线:已启用（设置菜单→WiFi配网可关）");
+  addLog(String("音量=") + ampVolumePercent + "% 速度=" + gameSpeedLevel + "/" + GAME_SPEED_LEVEL_MAX);
 }
 
 void saveForceOfflineConfig(bool enabled) {
@@ -844,6 +1270,47 @@ void saveForceOfflineConfig(bool enabled) {
   hostPrefs.putBool("forceoff", enabled);
   hostPrefs.end();
   forceOfflineBySwitch = enabled;
+}
+
+static int clampAmpVolume(int percent) {
+  if (percent < AMP_VOLUME_MIN) percent = AMP_VOLUME_MIN;
+  if (percent > AMP_VOLUME_MAX) percent = AMP_VOLUME_MAX;
+  int steps = (percent - AMP_VOLUME_MIN + AMP_VOLUME_STEP / 2) / AMP_VOLUME_STEP;
+  int v = AMP_VOLUME_MIN + steps * AMP_VOLUME_STEP;
+  if (v > AMP_VOLUME_MAX) v = AMP_VOLUME_MAX;
+  if (v < AMP_VOLUME_MIN) v = AMP_VOLUME_MIN;
+  return v;
+}
+
+static void applyAmpVolumeToSample(int16_t* s16) {
+  if (!s16) return;
+  int vol = ampVolumePercent;
+  if (vol >= 100) return;
+  if (vol <= 0) {
+    *s16 = 0;
+    return;
+  }
+  int32_t scaled = ((int32_t)(*s16) * vol) / 100;
+  if (scaled > 32767) scaled = 32767;
+  if (scaled < -32768) scaled = -32768;
+  *s16 = (int16_t)scaled;
+}
+
+void saveAmpVolumeConfig(int percent) {
+  ampVolumePercent = clampAmpVolume(percent);
+  hostPrefs.begin("hostcfg", false);
+  hostPrefs.putInt("ampvol", ampVolumePercent);
+  hostPrefs.end();
+}
+
+void saveGameSpeedConfig(int level) {
+  if (level < GAME_SPEED_LEVEL_MIN) level = GAME_SPEED_LEVEL_MIN;
+  if (level > GAME_SPEED_LEVEL_MAX) level = GAME_SPEED_LEVEL_MAX;
+  gameSpeedLevel = level;
+  syncSpawnIntervalFromSpeed();
+  hostPrefs.begin("hostcfg", false);
+  hostPrefs.putInt("gamespd", gameSpeedLevel);
+  hostPrefs.end();
 }
 
 void startConfigAP() {
@@ -904,6 +1371,16 @@ void setupWiFi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(hostname);
+  WiFi.setAutoReconnect(true);
+  // LR 必须在连接前设好；连上后再改协议会把 STA 踢下线，IP 变 0.0.0.0
+#if ENABLE_ESPNOW_LR
+  esp_wifi_set_protocol(WIFI_IF_STA,
+                        (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+#endif
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    wifiLastDisconnectReason = info.wifi_sta_disconnected.reason;
+    wifiDisconnectCount++;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   // 诊断射频：先扫一遍周围 2.4G，0 个则多半是天线/模组问题
   Serial.println("扫描周围 WiFi（诊断天线）...");
   int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
@@ -925,6 +1402,7 @@ void setupWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
+    wifiStaMode = true;
     wifiApMode = false;
     Serial.println("\nWiFi 连接成功");
     addLog("WiFi 连接成功");
@@ -1222,8 +1700,9 @@ void handleStatusPage() {
   page += "<style>body{font-family:-apple-system,sans-serif;padding:16px;} code{background:#f5f5f5;padding:2px 4px;} ";
   page += ".log{background:#1e1e1e;color:#d4d4d4;padding:8px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;}</style></head><body>";
   page += "<h2>主机 (LED 主控) 运行状态</h2>";
-  page += "<p><small>默认首页（<code>/</code>）即本页，含下方串口日志；串口 <code>debug on/off</code>；<b>GPIO6</b> 按住 <b>2～5 秒</b>松开切换 OLED 调试（运行中：首行速度+下方日志；未运行：全屏日志）；<b>按住满 5 秒</b>强制离线并重启。常规屏：多页滚动状态（约 4 秒翻页）。</small></p>";
-  page += "<p><small><b>详细日志（默认关）</b>：串口/网页里「已识别」「已回传」「[ESP-NOW] 收到」等会刷屏；<b>GPIO6 连续短按 3 次</b>（约 0.9s 内）切换，关闭后仅保留「收到开关A/B 按下」等按键日志。也可用串口 <code>verbose on</code>/<code>verbose off</code>。</small></p>";
+  page += "<p><small>默认首页（<code>/</code>）即本页。<b>GPIO6 长按 ≥2 秒</b>进出设置菜单（电视遥控器式：加减上下选，双击进入，单击返回）。菜单：音量 / 速度 / WiFi配网 / 重置游戏 / 调试屏 / 详细日志。<b>菜单外</b> GPIO7/8 仍直接加速减速（NVS）。</small></p>";
+  page += "<p><small><b>音量</b>：设置菜单或串口 <code>vol</code>/<code>vol 70</code>（NVS）。</small></p>";
+  page += "<p><small><b>详细日志（默认关）</b>：设置菜单或串口 <code>verbose on</code>/<code>verbose off</code>。</small></p>";
   page += "<p><b>主机名</b>：<code>" + String(hostname) + "</code></p>";
   page += "<p><b>WiFi 已连接</b>：" + String(wifiConnected ? "是" : "否") + "</p>";
   page += "<p><b>当前 SSID</b>：<code>" + (wifiSsid.length() ? wifiSsid : String("-")) + "</code></p>";
@@ -1251,7 +1730,8 @@ void handleStatusPage() {
     page += "</p>";
   }
   page += "<p><b>LED 数量</b>：" + String(NUM_LEDS) + "，亮度 " + String(FastLED.getBrightness()) + "</p>";
-  page += "<p><b>游戏速度</b>：" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（30=最快，1=最慢，默认15；GPIO7 +1 / GPIO8 -1）</p>";
+  page += "<p><b>游戏速度</b>：" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（30=最快，1=最慢；GPIO7 +1 / GPIO8 -1；已持久化）</p>";
+  page += "<p><b>喇叭音量</b>：" + String(ampVolumePercent) + "%（20～100；设置菜单 / 串口 vol；已持久化）</p>";
   page += "<p><b>OLED 调试</b>：" + String(oledSerialMirrorMode ? "开（屏仅日志）" : "关（屏常规）") + "</p>";
   page += "<p><b>详细开关日志</b>：" + String(verboseSwitchLog ? "开（已识别/回传/[ESP-NOW]收包等会显示）" : "关（默认，仅按键日志）") + "</p>";
   page += "<p><b>电脑出点间隔</b>：" + String(computerSpawnIntervalMs) + " ms（由速度档位映射）</p>";
@@ -1332,92 +1812,136 @@ void loop() {
   unsigned long currentTime = millis();
   flushDelayedCopies(currentTime);
 
-  // GPIO6：双短按→SET 重置游戏；三连击→详细日志；按住 2s～5s→OLED 调试；满 5s→强制离线重启
+  // STA 链路看门狗：wifiConnected 跟随真实状态；掉线记录原因并定期重连
+  if (wifiStaMode) {
+    static unsigned long wifiCheckMs = 0;
+    static unsigned long wifiLostSinceMs = 0;
+    static unsigned long wifiLastReconnectMs = 0;
+    static uint32_t wifiLoggedDisconnects = 0;
+    if (currentTime - wifiCheckMs >= 1000UL) {
+      wifiCheckMs = currentTime;
+      if (wifiDisconnectCount != wifiLoggedDisconnects) {
+        wifiLoggedDisconnects = wifiDisconnectCount;
+        addLog("WiFi 断开，原因码=" + String((int)wifiLastDisconnectReason) +
+               " 累计=" + String((unsigned long)wifiLoggedDisconnects));
+      }
+      bool up = (WiFi.status() == WL_CONNECTED) && (WiFi.localIP() != IPAddress(0, 0, 0, 0));
+      if (up && !wifiConnected) {
+        wifiConnected = true;
+        wifiLostSinceMs = 0;
+        addLog("WiFi 已恢复，IP: " + WiFi.localIP().toString());
+      } else if (!up && wifiConnected) {
+        wifiConnected = false;
+        wifiLostSinceMs = currentTime;
+        wifiLastReconnectMs = currentTime;
+        addLog("WiFi 掉线，等待自动重连…");
+      } else if (!up && wifiLostSinceMs != 0 && currentTime - wifiLastReconnectMs >= 10000UL) {
+        wifiLastReconnectMs = currentTime;
+        WiFi.reconnect();
+        addLog("WiFi 仍未连上，已发起重连（掉线 " + String((currentTime - wifiLostSinceMs) / 1000UL) + "s）");
+      }
+    }
+  }
+
+  // GPIO6 设置键：菜单外仅长按≥2s 进出设置；菜单内双击进入/确认、单击返回、加减选择
+  // 重置游戏 / WiFi 配网均在设置菜单内，不再用双击或长按 5s 叠功能
   static bool forceRawPrev = false;
   static unsigned long forcePressStart = 0;
   static bool forceHandled = false;
   static unsigned long gpio7TapLastMs = 0;
   static uint8_t gpio7TapCount = 0;
-  static unsigned long gpio7SetArmMs = 0;
+  static unsigned long settingsSingleArmMs = 0;  // 菜单内：单击返回
   bool forceRaw = (digitalRead(FORCE_OFFLINE_SWITCH_GPIO) == LOW);
   if (forceRaw && !forceRawPrev) {
     forcePressStart = currentTime;
     forceHandled = false;
   }
-  if (forceRaw && !forceHandled && (currentTime - forcePressStart) >= FORCE_OFFLINE_HOLD_MS) {
-    forceHandled = true;
-    bool next = !forceOfflineBySwitch;
-    saveForceOfflineConfig(next);
-    addLog(String("GPIO6 长按5s：强制离线已") + (next ? "启用" : "关闭") + "，即将重启");
-    delay(200);
-    ESP.restart();
-  }
   if (!forceRaw && forceRawPrev) {
     unsigned long dur = currentTime - forcePressStart;
     if (dur >= 25 && dur < GPIO7_SHORT_PRESS_MAX_MS && !forceHandled) {
-      if (currentTime - gpio7TapLastMs > GPIO7_TAP_WINDOW_MS) gpio7TapCount = 0;
-      gpio7TapCount++;
-      gpio7TapLastMs = currentTime;
-      if (gpio7TapCount >= 3) {
-        gpio7SetArmMs = 0;
-        gpio7TapCount = 0;
-        verboseSwitchLog = !verboseSwitchLog;
-        addLog(String("详细日志(ESP-NOW/识别/回传):") + (verboseSwitchLog ? "开" : "关"));
-#if BUZZER_ENABLE
-        buzzerSpeedFeedback();
-#endif
+      if (!hostSettingsActive()) {
+        // 菜单外短按忽略（一律走设置菜单）
+      } else {
+        if (currentTime - gpio7TapLastMs > GPIO7_TAP_WINDOW_MS) gpio7TapCount = 0;
+        gpio7TapCount++;
+        gpio7TapLastMs = currentTime;
+        if (gpio7TapCount >= 2) {
+          settingsSingleArmMs = 0;
+          gpio7TapCount = 0;
 #if OLED_ENABLE
-        if (oledOk) refreshOledScreen();
+          hostSettingsActivate();
 #endif
-      } else if (gpio7TapCount == 2) {
-        gpio7SetArmMs = currentTime;
+        } else if (gpio7TapCount == 1) {
+          settingsSingleArmMs = currentTime;
+        }
       }
-    } else if (dur >= OLED_DEBUG_HOLD_MIN_MS && dur < FORCE_OFFLINE_HOLD_MS && !forceHandled) {
-      oledSerialMirrorMode = !oledSerialMirrorMode;
-      addLog(String("GPIO6 长按2~5s：OLED调试 ") + (oledSerialMirrorMode ? "开" : "关"));
-#if BUZZER_ENABLE
-      buzzerSpeedFeedback();
-#endif
+    } else if (dur >= OLED_DEBUG_HOLD_MIN_MS && !forceHandled) {
 #if OLED_ENABLE
-      if (oledOk) refreshOledScreen();
+      if (hostSettingsActive()) hostSettingsExitMenu();
+      else hostSettingsEnterMenu();
+#else
+      addLog("无 OLED，无法打开设置菜单");
 #endif
     }
     forcePressStart = 0;
   }
   forceRawPrev = forceRaw;
 
-  // GPIO6 双短按 SET：0.9s 内无第 3 击则重置游戏（第 3 击留给详细日志）
-  if (gpio7SetArmMs != 0 && gpio7TapCount == 2 && (currentTime - gpio7SetArmMs) >= GPIO7_TAP_WINDOW_MS) {
-    hostResetGame();
+  // 菜单内：单击且未连成双击 → 返回上一级
+  if (hostSettingsActive() && settingsSingleArmMs != 0 && gpio7TapCount == 1 &&
+      (currentTime - settingsSingleArmMs) >= GPIO7_TAP_WINDOW_MS) {
+#if OLED_ENABLE
+    hostSettingsBack();
+#endif
+    settingsSingleArmMs = 0;
     gpio7TapCount = 0;
-    gpio7SetArmMs = 0;
   }
 
-  // GPIO7/8 调整游戏速度档位 1～30（每次 ±1；30 最快，1 最慢；默认 15）
+  // GPIO7/8：菜单内=上下选/调项；菜单外=调速度（NVS）
   static bool upPrev = false;
   static bool downPrev = false;
   bool upRaw = (digitalRead(GAME_SPEED_UP_GPIO) == LOW);
   bool downRaw = (digitalRead(GAME_SPEED_DOWN_GPIO) == LOW);
   if (upRaw && !upPrev) {
-    if (gameSpeedLevel < GAME_SPEED_LEVEL_MAX) {
-      gameSpeedLevel++;
-      syncSpawnIntervalFromSpeed();
-      addLog("GPIO7 加速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "，出点间隔=" + String(computerSpawnIntervalMs) + "ms");
+    if (hostSettingsActive()) {
 #if OLED_ENABLE
+      hostSettingsOnUp();
+#endif
+    } else if (gameSpeedLevel < GAME_SPEED_LEVEL_MAX) {
+      saveGameSpeedConfig(gameSpeedLevel + 1);
+      addLog("加速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（已保存）");
+      buzzerSpeedFeedback();
+#if OLED_ENABLE
+      oledArmSpeedFocus();
       refreshOledScreen();
 #endif
-      buzzerSpeedFeedback();
+    } else {
+      addLog("加速：已达最快 " + String(GAME_SPEED_LEVEL_MAX));
+#if OLED_ENABLE
+      oledArmSpeedFocus();
+      refreshOledScreen();
+#endif
     }
   }
   if (downRaw && !downPrev) {
-    if (gameSpeedLevel > GAME_SPEED_LEVEL_MIN) {
-      gameSpeedLevel--;
-      syncSpawnIntervalFromSpeed();
-      addLog("GPIO8 减速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "，出点间隔=" + String(computerSpawnIntervalMs) + "ms");
+    if (hostSettingsActive()) {
 #if OLED_ENABLE
+      hostSettingsOnDown();
+#endif
+    } else if (gameSpeedLevel > GAME_SPEED_LEVEL_MIN) {
+      saveGameSpeedConfig(gameSpeedLevel - 1);
+      addLog("减速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（已保存）");
+      buzzerSpeedFeedback();
+#if OLED_ENABLE
+      oledArmSpeedFocus();
       refreshOledScreen();
 #endif
-      buzzerSpeedFeedback();
+    } else {
+      addLog("减速：已达最慢 " + String(GAME_SPEED_LEVEL_MIN));
+#if OLED_ENABLE
+      oledArmSpeedFocus();
+      refreshOledScreen();
+#endif
     }
   }
   upPrev = upRaw;
@@ -1674,7 +2198,7 @@ void processCommand(String cmd) {
       hostResetGame();
       addLog("开关双击 RST：游戏已重置");
     } else {
-      addLogVerbose("忽略 RST：对战进行中；结果出来后双击可重置，或主机 GPIO6 双短按 SET");
+      addLogVerbose("忽略 RST：对战进行中；结果出来后双击可重置，或主机设置菜单→重置游戏");
     }
   } else if (cmd == "a") {
     lastSwitchPressed = 'A';
@@ -1699,6 +2223,18 @@ void processCommand(String cmd) {
     } else {
       Serial.println("亮度值必须在0-255之间");
     }
+  } else if (cmd == "vol" || cmd == "volume") {
+    Serial.printf("喇叭音量: %d%%（串口 vol 70 或设置菜单可改，已写入NVS）\n", ampVolumePercent);
+  } else if (cmd.startsWith("vol ") || cmd.startsWith("volume ")) {
+    int sp = cmd.indexOf(' ');
+    int v = cmd.substring(sp + 1).toInt();
+    saveAmpVolumeConfig(v);
+    Serial.printf("喇叭音量已设为 %d%%（已保存）\n", ampVolumePercent);
+    addLog(String("音量=") + ampVolumePercent + "%（串口）");
+#if OLED_ENABLE
+    oledArmVolumeFocus();
+    if (oledOk) refreshOledScreen();
+#endif
 #if AMP_TEST_ENABLE
   } else if (cmd == "amp" || cmd == "i2s") {
     playAmpTestTone(false);
@@ -1775,7 +2311,7 @@ void processCommand(String cmd) {
       Serial.println("WiFi: 未连接");
     }
   } else {
-    Serial.println("未知命令。可用: 1,2,3,A,B, brightness, status, debug, verbose on/off, espnow on/off");
+    Serial.println("未知命令。可用: 1,2,3,A,B, brightness, vol, status, debug, verbose on/off, espnow on/off, amp");
   }
 }
 
