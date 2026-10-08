@@ -33,7 +33,7 @@ String cachedHostIp;
 // 开关电路 & 指示灯
 #define BUTTON_GPIO        2    // 按钮 GPIO2-GND，内部上拉，按下为 LOW
 #define WHITE_LED_GPIO     3    // 中间白色指示灯 GPIO3
-// 板载蓝灯 CD2（GPIO8）：用作上电/运行指示灯。LOW=亮，HIGH=灭；进深度睡眠前拉 HIGH 省电
+// 板载蓝灯 CD2（GPIO8）：阴极接此脚，LOW=亮，HIGH=灭。待机保持熄灭，省电
 #define BOARD_POWER_LED_GPIO  8
 #define DEBOUNCE_STABLE_MS 12   // 稳定 12ms 认一次边沿，过大会漏检快按
 #define DEBOUNCE_PRESS_MS  80   // 两次按下至少间隔 80ms，支持快速连按匹配
@@ -119,6 +119,8 @@ static bool payloadIsFromHost(const uint8_t* data, int len) {
   if (len >= 3 && (memcmp(data, "BAD", 3) == 0 || memcmp(data, "WIN", 3) == 0 || memcmp(data, "GOF", 3) == 0 ||
                    memcmp(data, "COL", 3) == 0))
     return true;
+  // 主机测距：FTMB=B 开 FTM 应答，FTME=结束应答
+  if (len >= 4 && (memcmp(data, "FTMB", 4) == 0 || memcmp(data, "FTME", 4) == 0)) return true;
   return false;
 }
 
@@ -215,6 +217,11 @@ static void boostRadioForEspNow() {
 #endif
 }
 
+// 测距应答开着时为 true，挡住「对齐主机」重连
+static bool ftmBusy = false;
+static void ftmOnHostPayload(const uint8_t* data, int len);
+static void ftmRangeTick(unsigned long now);
+
 void setup() {
   Serial.begin(115200);
   delay(2000);
@@ -226,7 +233,7 @@ void setup() {
   pinMode(BUTTON_GPIO, INPUT_PULLUP);
   pinMode(WHITE_LED_GPIO, OUTPUT);
   pinMode(BOARD_POWER_LED_GPIO, OUTPUT);
-  digitalWrite(BOARD_POWER_LED_GPIO, LOW);   // 蓝灯 CD2：LOW=亮，表示上电/运行中
+  digitalWrite(BOARD_POWER_LED_GPIO, HIGH);  // 蓝灯 CD2：待机熄灭，省电
   ledcSetup(0, 5000, 8);           // 白灯用 PWM，便于呼吸效果
   ledcAttachPin(WHITE_LED_GPIO, 0);
   ledcWrite(0, 0);
@@ -515,6 +522,7 @@ static void markHostEspNowReachable() {
 
 void pollHostAlignHealth(unsigned long now, bool force) {
   if (otaInProgress) return;  // OTA 期间不执行阻塞 HTTP，避免拖慢上传
+  if (ftmBusy) return;        // 测距应答开着时不要重连，避免拆掉 FTM 热点
   if (!wifiConnected || wifiApMode) return;
   // 游戏进行中（COL meta 高 4 位 gs==1）跳过阻塞 HTTP 轮询，降低按键延迟；
   // 链路活性由 ESP-NOW 心跳/ACK 保证（markHostEspNowReachable）
@@ -825,6 +833,11 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     hostMacValid = true;
     lastHostPacketMs = millis();
   }
+  if (len >= 4 && (memcmp(data, "FTMB", 4) == 0 || memcmp(data, "FTME", 4) == 0)) {
+    markHostEspNowReachable();
+    ftmOnHostPayload(data, len);
+    return;
+  }
   if (len >= 5 && memcmp(data, ACK_MSG, 5) == 0) {
     lastAckTime = millis();
     markHostEspNowReachable();
@@ -963,6 +976,120 @@ void sendCommandEx(const char* cmd, int copies) {
 }
 
 void sendCommand(const char* cmd) { sendCommandEx(cmd, 1); }
+
+// ---------- A-B 开机测距：B 是 FTM 应答端 ----------
+// 在线和家里 WiFi 同信道再开一个开放热点 CC-FTM（ftm_responder）。
+// A 不用连这个热点也能发起测距；连不上时 A 会临时连上来再测。测完主机关掉。
+
+static const unsigned long FTM_RESP_HOLD_MS = 70000UL;
+static volatile bool ftmStartPending = false;
+static volatile bool ftmStopPending = false;
+static bool ftmResponderOn = false;
+static bool ftmUsedExtraAp = false;
+static unsigned long ftmResponderUntilMs = 0;
+static char ftmReportMsg[40] = {0};
+
+static uint8_t ftmCurrentChannel() {
+  uint8_t ch = 0;
+  wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
+  if (esp_wifi_get_channel(&ch, &sec) != ESP_OK || ch < 1 || ch > 13) {
+    ch = apChannelInUse;
+  }
+  if (ch < 1 || ch > 13) ch = 1;
+  return ch;
+}
+
+static bool ftmPublishReport(uint8_t ch, char kind) {
+  uint8_t apmac[6];
+  if (esp_wifi_get_mac(WIFI_IF_AP, apmac) != ESP_OK) return false;
+  snprintf(ftmReportMsg, sizeof(ftmReportMsg), "FTMR,%02X%02X%02X%02X%02X%02X,%u,%c",
+           apmac[0], apmac[1], apmac[2], apmac[3], apmac[4], apmac[5], ch, kind);
+  sendCommandEx(ftmReportMsg, 3);
+  return true;
+}
+
+static bool ftmStartResponder() {
+  uint8_t ch = ftmCurrentChannel();
+  bool offlineAp = (!wifiConnected && wifiApMode);
+  if (offlineAp) {
+    wifi_config_t conf = {};
+    if (esp_wifi_get_config(WIFI_IF_AP, &conf) != ESP_OK) return false;
+    conf.ap.ftm_responder = true;
+    conf.ap.channel = ch;
+    if (esp_wifi_set_config(WIFI_IF_AP, &conf) != ESP_OK) return false;
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+    ftmUsedExtraAp = false;
+    if (!ftmPublishReport(ch, 'A')) return false;
+    addLog(String("FTM应答已开(现有热点) ch=") + ch);
+  } else {
+    if (!WiFi.softAP("CC-FTM", nullptr, ch, 0, 1, true)) {
+      addLog("CC-FTM 热点打开失败");
+      return false;
+    }
+    esp_wifi_set_protocol(WIFI_IF_AP, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_max_tx_power(84);
+    ftmUsedExtraAp = true;
+    if (!ftmPublishReport(ch, 'O')) {
+      WiFi.softAPdisconnect(true);
+      ftmUsedExtraAp = false;
+      return false;
+    }
+    addLog(String("FTM应答已开 CC-FTM ch=") + ch);
+  }
+  ftmResponderOn = true;
+  ftmBusy = true;
+  ftmResponderUntilMs = millis() + FTM_RESP_HOLD_MS;
+  return true;
+}
+
+static void ftmStopResponder() {
+  if (!ftmResponderOn && !ftmUsedExtraAp) {
+    ftmBusy = false;
+    return;
+  }
+  if (ftmUsedExtraAp) {
+    WiFi.softAPdisconnect(true);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    ftmUsedExtraAp = false;
+  }
+  ftmResponderOn = false;
+  ftmBusy = false;
+  addLog("FTM应答已关");
+}
+
+static void ftmOnHostPayload(const uint8_t* data, int len) {
+  if (len >= 4 && memcmp(data, "FTME", 4) == 0) {
+    ftmStopPending = true;
+    ftmStartPending = false;
+    return;
+  }
+  if (len >= 4 && memcmp(data, "FTMB", 4) == 0) {
+    ftmStartPending = true;
+  }
+}
+
+static void ftmRangeTick(unsigned long now) {
+  if (ftmStopPending) {
+    ftmStopPending = false;
+    ftmStartPending = false;
+    ftmStopResponder();
+    return;
+  }
+  if (ftmStartPending) {
+    ftmStartPending = false;
+    if (ftmResponderOn && ftmReportMsg[0]) {
+      ftmResponderUntilMs = now + FTM_RESP_HOLD_MS;
+      sendCommandEx(ftmReportMsg, 3);
+    } else {
+      ftmStartResponder();
+    }
+  }
+  if (ftmResponderOn && (long)(now - ftmResponderUntilMs) >= 0) {
+    ftmStopResponder();
+  }
+}
 
 void printLedHelp() {
   Serial.println("--- 灯环测试（串口命令）---");
@@ -1212,11 +1339,12 @@ void loop() {
 
   unsigned long now = millis();
   ensureMdnsReady(now);
+  ftmRangeTick(now);
   // 心跳：每 2 秒发一次 PB 维持在线检测（已学到主机 MAC 则单播）；
   // 每 5 次或主机 12s 无任何消息时补一包广播兜底（主机 MAC 变化/丢单播时可自愈）
   static unsigned long lastHb = 0;
   static uint32_t hbCount = 0;
-  if (espNowReady && (now - lastHb) >= 2000) {
+  if (espNowReady && !ftmBusy && (now - lastHb) >= 2000) {
     lastHb = now;
     hbCount++;
     sendCommand("PB");
@@ -1378,6 +1506,12 @@ void loop() {
       } else {
         Serial.println("亮度 0-255");
       }
+    } else if (cmd == "ftm") {
+      ftmStartPending = true;
+      Serial.println("已排队打开 FTM 应答");
+    } else if (cmd == "ftme") {
+      ftmStopPending = true;
+      Serial.println("已排队关闭 FTM 应答");
     } else if (cmd == "help" || cmd == "led") {
       printLedHelp();
     } else if (cmd.length() > 0) {

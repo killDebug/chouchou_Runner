@@ -119,6 +119,8 @@ static bool payloadIsFromHost(const uint8_t* data, int len) {
   if (len >= 3 && (memcmp(data, "BAD", 3) == 0 || memcmp(data, "WIN", 3) == 0 || memcmp(data, "GOF", 3) == 0 ||
                    memcmp(data, "COL", 3) == 0))
     return true;
+  // 主机测距：FTMA=让 A 对 B 发起 FTM
+  if (len >= 4 && (memcmp(data, "FTMA", 4) == 0 || memcmp(data, "FTMX", 4) == 0)) return true;
   return false;
 }
 
@@ -199,6 +201,13 @@ static void applyStaProtocolBeforeConnect() {
 #endif
 }
 
+/** 测距不能带 LR，也不能用 40MHz。调用前会先断开家里 WiFi。 */
+static void applyStaProtocolForFtm() {
+  esp_wifi_set_protocol(WIFI_IF_STA, (uint8_t)(WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+}
+
 static void boostRadioForEspNow() {
   esp_wifi_set_ps(WIFI_PS_NONE);   // modem sleep 是 ESP-NOW 近距丢包主因之一
   esp_wifi_set_max_tx_power(84);   // 上限由 IDF 按地区自动钳制
@@ -216,6 +225,12 @@ static void boostRadioForEspNow() {
   addLog("射频：已关省电+满功率");
 #endif
 }
+
+// 测距进行中为 true，挡住「对齐主机」重连，避免把 FTM 用的信道拆掉
+static bool ftmBusy = false;
+static void ftmOnHostPayload(const uint8_t* data, int len);
+static void ftmRangeTick(unsigned long now);
+static void onFtmWifiEvent(arduino_event_id_t event, arduino_event_info_t info);
 
 void setup() {
   Serial.begin(115200);
@@ -248,6 +263,7 @@ void setup() {
   setupWiFi();
   alignToHostApIfNeeded();
   boostRadioForEspNow();
+  WiFi.onEvent(onFtmWifiEvent, ARDUINO_EVENT_WIFI_FTM_REPORT);
   setupOTA();
   setupEspNow();
 
@@ -516,6 +532,7 @@ static void markHostEspNowReachable() {
 
 void pollHostAlignHealth(unsigned long now, bool force) {
   if (otaInProgress) return;  // OTA 期间不执行阻塞 HTTP，避免拖慢上传
+  if (ftmBusy) return;        // 测距中不要重连家里 WiFi，避免把 FTM 信道拆掉
   if (!wifiConnected || wifiApMode) return;
   // 游戏进行中（COL meta 高 4 位 gs==1）跳过阻塞 HTTP 轮询，降低按键延迟；
   // 链路活性由 ESP-NOW 心跳/ACK 保证（markHostEspNowReachable）
@@ -827,6 +844,11 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
     hostMacValid = true;
     lastHostPacketMs = millis();
   }
+  if (len >= 4 && (memcmp(data, "FTMA", 4) == 0 || memcmp(data, "FTMX", 4) == 0)) {
+    markHostEspNowReachable();
+    ftmOnHostPayload(data, len);
+    return;
+  }
   if (len >= 5 && memcmp(data, ACK_MSG, 5) == 0) {
     lastAckTime = millis();
     markHostEspNowReachable();
@@ -965,6 +987,360 @@ void sendCommandEx(const char* cmd, int copies) {
 }
 
 void sendCommand(const char* cmd) { sendCommandEx(cmd, 1); }
+
+// ---------- A-B 开机测距：A 是 FTM 发起端 ----------
+// 距离只在游戏开始前量一次。B 开同信道 FTM 应答热点，A 连续测十几次，
+// 去掉两头异常值后取中位数，再把厘米数发给主机锁定。游戏过程中不再测。
+
+static const int FTM_TARGET_OK = 8;
+static const int FTM_MIN_OK = 4;
+static const int FTM_MAX_ATTEMPT = 8;
+static const char* FTM_AP_SSID = "CC-FTM";
+
+enum FtmPhase : uint8_t { FTM_IDLE = 0, FTM_PREP, FTM_DIRECT, FTM_ASSOC_WAIT, FTM_ASSOC, FTM_RESTORE };
+
+static FtmPhase ftmPhase = FTM_IDLE;
+static uint8_t ftmRespMac[6] = {0};
+static uint8_t ftmChannel = 1;
+static bool ftmOpenAp = true;
+static bool ftmLeftHome = false;
+static volatile bool ftmRequestPending = false;
+static volatile bool ftmAbortPending = false;
+static uint16_t ftmSamples[FTM_MAX_ATTEMPT];
+static int ftmSampleCount = 0;
+static int ftmAttempt = 0;
+static int ftmNoRespStreak = 0;
+static bool ftmSessionPending = false;
+static unsigned long ftmSessionStartMs = 0;
+static unsigned long ftmPhaseStartMs = 0;
+static unsigned long ftmNextKickMs = 0;
+
+static volatile bool ftmReportReady = false;
+static volatile uint8_t ftmReportStatus = 0;
+static volatile uint32_t ftmReportDistCm = 0;
+static volatile uint32_t ftmReportRttNs = 0;
+static char ftmResultMsg[32] = {0};
+static bool ftmResultPending = false;
+
+/** 测距时关掉了 LR，这时发出的 ESP-NOW 主机收不到。先把 LR 和信道恢复再交结果。 */
+static void ftmDeliverResult() {
+  if (!ftmResultPending || ftmResultMsg[0] == 0) return;
+  applyStaProtocolBeforeConnect();
+  esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+  esp_wifi_set_channel(ftmChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_max_tx_power(84);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  sendCommandEx(ftmResultMsg, 3);
+}
+
+static void onFtmWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  if (event != ARDUINO_EVENT_WIFI_FTM_REPORT) return;
+  wifi_event_ftm_report_t* report = &info.wifi_ftm_report;
+  ftmReportStatus = (uint8_t)report->status;
+  ftmReportDistCm = report->dist_est;
+  ftmReportRttNs = report->rtt_est;
+  if (report->ftm_report_data) {
+    free(report->ftm_report_data);
+    report->ftm_report_data = nullptr;
+  }
+  ftmReportReady = true;
+}
+
+static int ftmCmpU16(const void* a, const void* b) {
+  uint16_t xa = *static_cast<const uint16_t*>(a);
+  uint16_t xb = *static_cast<const uint16_t*>(b);
+  if (xa < xb) return -1;
+  if (xa > xb) return 1;
+  return 0;
+}
+
+static bool ftmParseMacCh(const char* s, uint8_t mac[6], int* ch, char* kind) {
+  if (!s || strlen(s) < 14) return false;
+  for (int i = 0; i < 6; i++) {
+    char h[3] = {s[i * 2], s[i * 2 + 1], 0};
+    if (!isxdigit((unsigned char)h[0]) || !isxdigit((unsigned char)h[1])) return false;
+    mac[i] = (uint8_t)strtoul(h, nullptr, 16);
+  }
+  if (s[12] != ',') return false;
+  char* end = nullptr;
+  long c = strtol(s + 13, &end, 10);
+  if (!end || end == s + 13 || c < 1 || c > 13) return false;
+  *ch = (int)c;
+  *kind = 'O';
+  if (*end == ',' && end[1]) *kind = (char)toupper((unsigned char)end[1]);
+  return true;
+}
+
+static void ftmOnHostPayload(const uint8_t* data, int len) {
+  if (len >= 4 && memcmp(data, "FTMX", 4) == 0) {
+    ftmAbortPending = true;
+    ftmRequestPending = false;
+    return;
+  }
+  if (ftmBusy || ftmRequestPending) return;
+  char buf[48];
+  int n = len < 47 ? len : 47;
+  if (n < 18) return;
+  memcpy(buf, data, n);
+  buf[n] = 0;
+  if (strncmp(buf, "FTMA,", 5) != 0) return;
+  int ch = 0;
+  char kind = 'O';
+  uint8_t mac[6];
+  if (!ftmParseMacCh(buf + 5, mac, &ch, &kind)) return;
+  memcpy(ftmRespMac, mac, 6);
+  ftmChannel = (uint8_t)ch;
+  ftmOpenAp = (kind != 'A');
+  ftmRequestPending = true;
+}
+
+static void ftmKickSession() {
+  if (ftmReportReady) return;
+  wifi_ftm_initiator_cfg_t cfg = {};
+  memcpy(cfg.resp_mac, ftmRespMac, 6);
+  cfg.channel = ftmChannel;
+  cfg.frm_count = 16;
+  cfg.burst_period = 2;
+  ftmSessionStartMs = millis();
+  esp_err_t err = esp_wifi_ftm_initiate_session(&cfg);
+  if (err != ESP_OK) {
+    ftmSessionPending = false;
+    ftmAttempt++;
+    ftmNoRespStreak++;
+    addLog(String("FTM发起失败 ") + (int)err);
+    ftmNextKickMs = millis() + 200;
+    return;
+  }
+  ftmSessionPending = true;
+}
+
+static void ftmStartAssoc() {
+  addLog("直连无应答，改连 CC-FTM 再测");
+  if (ftmSessionPending) {
+    esp_wifi_ftm_end_session();
+    ftmSessionPending = false;
+  }
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode == WIFI_MODE_AP || mode == WIFI_MODE_NULL) WiFi.mode(WIFI_AP_STA);
+  applyStaProtocolForFtm();
+  WiFi.disconnect(false, false);
+  WiFi.begin(FTM_AP_SSID, "", ftmChannel, ftmRespMac, true);
+  ftmPhase = FTM_ASSOC_WAIT;
+  ftmPhaseStartMs = millis();
+  ftmNoRespStreak = 0;
+}
+
+static void ftmFinish(bool ok) {
+  if (ftmSessionPending) {
+    esp_wifi_ftm_end_session();
+    ftmSessionPending = false;
+  }
+  char msg[32];
+  if (!ok || ftmSampleCount < FTM_MIN_OK) {
+    snprintf(msg, sizeof(msg), "DST,0,%d,0", ftmSampleCount);
+    addLog(String("FTM有效样本不足 n=") + ftmSampleCount);
+  } else {
+    uint16_t sorted[FTM_MAX_ATTEMPT];
+    memcpy(sorted, ftmSamples, (size_t)ftmSampleCount * sizeof(uint16_t));
+    qsort(sorted, (size_t)ftmSampleCount, sizeof(uint16_t), ftmCmpU16);
+    int drop = (ftmSampleCount >= 12) ? 2 : 1;
+    int lo = drop;
+    int hi = ftmSampleCount - drop;
+    int keep = hi - lo;
+    if (keep < 4) {
+      lo = 0;
+      hi = ftmSampleCount;
+      keep = ftmSampleCount;
+    }
+    uint32_t sum = 0;
+    for (int i = lo; i < hi; i++) sum += sorted[i];
+    uint16_t mean = (uint16_t)(sum / (uint32_t)keep);
+    int mid = lo + keep / 2;
+    uint16_t med = (keep % 2) ? sorted[mid] : (uint16_t)((sorted[mid - 1] + sorted[mid]) / 2);
+    uint16_t spread = (uint16_t)(sorted[hi - 1] - sorted[lo]);
+    snprintf(msg, sizeof(msg), "DST,%u,%d,%u", med, keep, spread);
+    addLog(String("FTM结果 中位") + med + "cm 平均" + mean + "cm 样本" + keep +
+           " 离散" + spread + " 最小" + sorted[lo] + " 最大" + sorted[hi - 1]);
+    Serial.print("FTM samples cm:");
+    for (int i = 0; i < ftmSampleCount; i++) {
+      Serial.print(' ');
+      Serial.print(ftmSamples[i]);
+    }
+    Serial.println();
+  }
+  snprintf(ftmResultMsg, sizeof(ftmResultMsg), "%s", msg);
+  ftmResultPending = true;
+  bool needRestore = ftmLeftHome || ftmPhase == FTM_ASSOC || ftmPhase == FTM_ASSOC_WAIT;
+  ftmLeftHome = false;
+  if (needRestore && wifiSsid.length() > 0) {
+    applyStaProtocolBeforeConnect();
+    esp_wifi_set_channel(ftmChannel, WIFI_SECOND_CHAN_NONE);
+    ftmDeliverResult();
+    WiFi.disconnect(false, false);
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    ftmPhase = FTM_RESTORE;
+    ftmPhaseStartMs = millis();
+    ftmBusy = true;
+    addLog("测距结束，正在回到家里 WiFi");
+  } else {
+    ftmDeliverResult();
+    ftmResultPending = false;
+    ftmBusy = false;
+    ftmPhase = FTM_IDLE;
+  }
+}
+
+static void ftmBegin() {
+  ftmBusy = true;
+  ftmSampleCount = 0;
+  ftmAttempt = 0;
+  ftmNoRespStreak = 0;
+  ftmReportReady = false;
+  ftmSessionPending = false;
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode == WIFI_MODE_AP || mode == WIFI_MODE_NULL) WiFi.mode(WIFI_AP_STA);
+  applyStaProtocolForFtm();
+  ftmLeftHome = wifiConnected && wifiSsid.length() > 0;
+  ftmPhaseStartMs = millis();
+  ftmNextKickMs = 0;
+  if (ftmLeftHome) {
+    wifiConnected = false;
+    WiFi.disconnect(false, false);
+    ftmPhase = FTM_PREP;
+    addLog(String("测距先断开家里WiFi并关掉LR ch=") + ftmChannel);
+  } else {
+    esp_wifi_set_channel(ftmChannel, WIFI_SECOND_CHAN_NONE);
+    ftmPhase = FTM_DIRECT;
+    addLog(String("开始FTM ch=") + ftmChannel + (ftmOpenAp ? " 可连CC-FTM" : " 仅直连"));
+    ftmKickSession();
+  }
+}
+
+static void ftmConsumeReport() {
+  uint8_t st = ftmReportStatus;
+  uint32_t cm = ftmReportDistCm;
+  uint32_t rtt = ftmReportRttNs;
+  ftmReportReady = false;
+  ftmSessionPending = false;
+  ftmAttempt++;
+  if (st == FTM_STATUS_SUCCESS && (cm < 10 || cm > 5000) && rtt >= 1 && rtt < 400) {
+    uint32_t fromRtt = (uint32_t)((uint64_t)rtt * 299792458ULL / 20000000ULL);
+    if (fromRtt >= 10 && fromRtt <= 5000) cm = fromRtt;
+  }
+  if (st == FTM_STATUS_SUCCESS && cm >= 10 && cm <= 5000 && ftmSampleCount < FTM_MAX_ATTEMPT) {
+    ftmSamples[ftmSampleCount++] = (uint16_t)cm;
+    ftmNoRespStreak = 0;
+    Serial.printf("FTM #%d %lucm rtt=%luns\n", ftmAttempt, (unsigned long)cm, (unsigned long)rtt);
+  } else {
+    if (st == FTM_STATUS_NO_RESPONSE || st == FTM_STATUS_FAIL) ftmNoRespStreak++;
+    else ftmNoRespStreak++;
+    Serial.printf("FTM #%d 失败 status=%u dist=%lu\n", ftmAttempt, st, (unsigned long)cm);
+  }
+  ftmNextKickMs = millis() + 120;
+}
+
+static void ftmCancel() {
+  if (ftmSessionPending) {
+    esp_wifi_ftm_end_session();
+    ftmSessionPending = false;
+  }
+  bool needRestore = ftmLeftHome || ftmPhase == FTM_ASSOC || ftmPhase == FTM_ASSOC_WAIT;
+  ftmLeftHome = false;
+  ftmReportReady = false;
+  if (needRestore && wifiSsid.length() > 0) {
+    applyStaProtocolBeforeConnect();
+    WiFi.disconnect(false, false);
+    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    ftmPhase = FTM_RESTORE;
+    ftmPhaseStartMs = millis();
+    ftmBusy = true;
+    addLog("测距被取消，正在回到家里 WiFi");
+  } else {
+    ftmBusy = false;
+    ftmPhase = FTM_IDLE;
+    addLog("测距已取消");
+  }
+}
+
+static void ftmRangeTick(unsigned long now) {
+  if (ftmAbortPending) {
+    ftmAbortPending = false;
+    ftmRequestPending = false;
+    if (ftmBusy) ftmCancel();
+    return;
+  }
+  if (ftmRequestPending && !ftmBusy) {
+    ftmBusy = true;
+    ftmRequestPending = false;
+    ftmBegin();
+  }
+  if (!ftmBusy) return;
+
+  if (ftmPhase == FTM_PREP) {
+    if ((unsigned long)(now - ftmPhaseStartMs) >= 400UL) {
+      esp_wifi_set_channel(ftmChannel, WIFI_SECOND_CHAN_NONE);
+      ftmPhase = FTM_DIRECT;
+      ftmPhaseStartMs = now;
+      addLog(String("开始FTM ch=") + ftmChannel);
+      ftmKickSession();
+    }
+    return;
+  }
+
+  if (ftmPhase == FTM_ASSOC_WAIT) {
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == FTM_AP_SSID) {
+      ftmPhase = FTM_ASSOC;
+      addLog("已连上 CC-FTM，继续测距");
+      ftmKickSession();
+    } else if ((unsigned long)(now - ftmPhaseStartMs) >= 5000UL) {
+      addLog("连不上 CC-FTM");
+      ftmFinish(false);
+    }
+    return;
+  }
+
+  if (ftmPhase == FTM_RESTORE) {
+    if (WiFi.status() == WL_CONNECTED || (unsigned long)(now - ftmPhaseStartMs) >= 12000UL) {
+      if (WiFi.status() == WL_CONNECTED) ftmDeliverResult();
+      ftmResultPending = false;
+      ftmBusy = false;
+      ftmPhase = FTM_IDLE;
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        addLog("已回到家里 WiFi");
+      }
+      else addLog("回家里 WiFi 超时，交给自动重连");
+    }
+    return;
+  }
+
+  if (ftmPhase != FTM_DIRECT && ftmPhase != FTM_ASSOC) return;
+
+  if (ftmReportReady) {
+    ftmConsumeReport();
+  } else if (ftmSessionPending) {
+    if ((unsigned long)(now - ftmSessionStartMs) < 1200UL) return;
+    esp_wifi_ftm_end_session();
+    ftmSessionPending = false;
+    ftmAttempt++;
+    ftmNoRespStreak++;
+    Serial.printf("FTM #%d 超时\n", ftmAttempt);
+    ftmNextKickMs = now + 120;
+  }
+
+  if ((long)(now - ftmNextKickMs) < 0) return;
+  if (ftmSessionPending || ftmReportReady) return;
+
+  if (ftmSampleCount >= FTM_TARGET_OK || ftmAttempt >= FTM_MAX_ATTEMPT) {
+    ftmFinish(ftmSampleCount >= FTM_MIN_OK);
+    return;
+  }
+  if (ftmPhase == FTM_DIRECT && ftmOpenAp && ftmSampleCount == 0 && ftmNoRespStreak >= 3) {
+    ftmStartAssoc();
+    return;
+  }
+  ftmKickSession();
+}
 
 void printLedHelp() {
   Serial.println("--- 灯环测试（串口命令）---");
@@ -1213,13 +1589,14 @@ void loop() {
 
   unsigned long now = millis();
   ensureMdnsReady(now);
+  ftmRangeTick(now);
   pollHostAlignHealth(now, hostAlignForceRetry);
   hostAlignForceRetry = false;
   // 心跳：每 2 秒发一次 PA 维持在线检测（已学到主机 MAC 则单播）；
   // 每 5 次或主机 12s 无任何消息时补一包广播兜底（主机 MAC 变化/丢单播时可自愈）
   static unsigned long lastHb = 0;
   static uint32_t hbCount = 0;
-  if (espNowReady && (now - lastHb) >= 2000) {
+  if (espNowReady && !ftmBusy && (now - lastHb) >= 2000) {
     lastHb = now;
     hbCount++;
     sendCommand("PA");
@@ -1378,6 +1755,18 @@ void loop() {
         Serial.println(b);
       } else {
         Serial.println("亮度 0-255");
+      }
+    } else if (cmd.startsWith("ftm")) {
+      String rest = cmd.substring(3);
+      rest.trim();
+      rest.replace(' ', ',');
+      if (rest.length() >= 14) {
+        String payload = String("FTMA,") + rest;
+        if (payload.indexOf(',') == payload.lastIndexOf(',')) payload += ",O";
+        ftmOnHostPayload((const uint8_t*)payload.c_str(), payload.length());
+        Serial.println("已排队 FTM 测距");
+      } else {
+        Serial.println("用法: ftm <12位MAC> <信道>  例: ftm aabbccddeeff 6");
       }
     } else if (cmd == "help" || cmd == "led") {
       printLedHelp();

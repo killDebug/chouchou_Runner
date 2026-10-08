@@ -11,7 +11,7 @@ typedef void (*GameEventFn)(GameEvent);
 
 class GameManager {
  public:
-  static constexpr int kMaxDots = 40;
+  static constexpr int kMaxDots = 96;
   static constexpr unsigned long kPauseHardResetMs = 90000;
 
   void configure(int numLeds, int computerSpawnIntervalMs, int moveIntervalMs);
@@ -61,6 +61,8 @@ class GameManager {
   void clearDots();
   void compactDots();
   bool addDot(int position, int direction, uint8_t colorIndex, int16_t fixedHue = -1, uint8_t* outHue = nullptr);
+  /** 灯点槽满时腾一位给玩家。防守中保留最旧的那颗电脑点。 */
+  bool releaseOneDotForPlayer(bool defending, uint8_t defendColor);
   bool findOldestComputerHue(uint8_t colorIndex, uint8_t& hue) const;
   void spawnComputerDot(uint8_t colorIndex);
   void spawnPlayerDot(uint8_t colorIndex);
@@ -81,7 +83,8 @@ class GameManager {
   uint8_t peekPlayerLeadHue() const;
   void consumeColor();
 
-  static constexpr int kMaxPending = 16;
+  static constexpr int kMaxPending = 48;
+  static constexpr int kPlayerReserve = 8;
   uint8_t pendingColors_[kMaxPending];
   int pendingCount_ = 0;
   uint8_t playerLeadColors_[kMaxPending];

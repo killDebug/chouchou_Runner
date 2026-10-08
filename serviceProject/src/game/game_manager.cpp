@@ -160,6 +160,45 @@ bool GameManager::addDot(int position, int direction, uint8_t colorIndex, int16_
   return false;
 }
 
+bool GameManager::releaseOneDotForPlayer(bool defending, uint8_t defendColor) {
+  if (dotCount_ < kMaxDots) return true;
+  int protect = -1;
+  if (defending) {
+    int bestPos = -1;
+    for (int i = 0; i < kMaxDots; i++) {
+      if (!dots_[i].active || dots_[i].direction != +1) continue;
+      if (dots_[i].colorIndex != defendColor) continue;
+      if (protect < 0 || dots_[i].position > bestPos) {
+        bestPos = dots_[i].position;
+        protect = i;
+      }
+    }
+  }
+  int victim = -1;
+  int victimPos = 999999;
+  for (int i = 0; i < kMaxDots; i++) {
+    if (!dots_[i].active || dots_[i].direction != +1 || i == protect) continue;
+    if (dots_[i].position < victimPos) {
+      victimPos = dots_[i].position;
+      victim = i;
+    }
+  }
+  if (victim < 0) {
+    victimPos = 999999;
+    for (int i = 0; i < kMaxDots; i++) {
+      if (!dots_[i].active || dots_[i].direction != -1) continue;
+      if (dots_[i].position < victimPos) {
+        victimPos = dots_[i].position;
+        victim = i;
+      }
+    }
+  }
+  if (victim < 0) return false;
+  dots_[victim].active = false;
+  dotCount_--;
+  return true;
+}
+
 void GameManager::spawnComputerDot(uint8_t colorIndex) {
   addDot(0, +1, colorIndex);
 }
@@ -204,7 +243,8 @@ void GameManager::setGameResult(GameState r, bool switchAMacValid, bool switchBM
 void GameManager::tickRunning(unsigned long now, bool switchAMacValid, bool switchBMacValid, void (*sendToA)(const uint8_t*, size_t),
                               void (*sendToB)(const uint8_t*, size_t)) {
   // 电脑按间隔出点：有玩家抢先则跟同色同色相；否则取色流。玩家刚出手的同一帧不再出新色。
-  if (now - lastComputerSpawnMs_ >= (unsigned long)computerSpawnIntervalMs_) {
+  if (now - lastComputerSpawnMs_ >= (unsigned long)computerSpawnIntervalMs_ &&
+      dotCount_ < kMaxDots - kPlayerReserve) {
     if (playerLeadCount_ > 0) {
       uint8_t c = peekPlayerLead();
       uint8_t h = peekPlayerLeadHue();
@@ -366,16 +406,21 @@ void GameManager::onButtonPress(char btn, unsigned long now, bool connReady, boo
     uint8_t matchedHue = 0;
     if (findOldestComputerHue(c, matchedHue)) hue = (int16_t)matchedHue;
   } else {
-    if (playerLeadCount_ >= kMaxPending) return;
     c = colors_.currentColor();
     hue = (int16_t)colors_.currentHue();
   }
+  if (dotCount_ >= kMaxDots && !releaseOneDotForPlayer(defending, c)) return;
   uint8_t spawnedHue = 0;
   if (!addDot(numLeds_ - 1, -1, c, hue, &spawnedHue)) return;
   if (defending) {
     popPending(c);
   } else {
     consumeColor();
+    if (playerLeadCount_ >= kMaxPending) {
+      uint8_t dropC = 0;
+      uint8_t dropH = 0;
+      popPlayerLead(dropC, dropH);
+    }
     pushPlayerLead(c, spawnedHue);
   }
   playerShotThisTick_ = true;

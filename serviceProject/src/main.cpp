@@ -14,6 +14,7 @@
 #include <math.h>
 #include "game/game_manager.h"
 #include "audio/boot_assets.h"
+#include "audio/game_clips.h"
 
 // WS2812B配置（ESP32-S3 N8R8：信号脚 GPIO4→12 连续，见 引脚迁移.md）
 #define LED_PIN 2          // 灯带 DIN → GPIO2（单独 XH-2）
@@ -47,7 +48,7 @@ bool wifiApMode      = false;
 bool httpServerStarted = false;
 
 // ESP-NOW 接收（无线开关发来的命令，低延迟、无需路由器）
-#define ESP_NOW_CMD_MAX 32
+#define ESP_NOW_CMD_MAX 48
 static char espNowCmdBuf[ESP_NOW_CMD_MAX];
 static uint8_t espNowCmdMac[6] = {0};  // 与缓冲内容对应的发送方 MAC（用于按键重发去重）
 static volatile bool espNowCmdPending = false;
@@ -214,6 +215,26 @@ static const unsigned long OLED_VOLUME_FOCUS_MS = 2500UL;
 /** 喇叭软件音量（%），播 PCM/测试音时乘上去；NVS 键 ampvol */
 int ampVolumePercent = AMP_VOLUME_DEFAULT;
 
+// 开机校准得到的 A-B 跑道距离（厘米）。游戏过程中不再改。
+// 往返跑速度 = trackDistanceCm / 100 / 分段时间，接入成绩计算时再用。
+enum TrackRangePhase : uint8_t { TR_IDLE = 0, TR_WAIT_B, TR_WAIT_A, TR_LOCKED, TR_FAIL };
+static TrackRangePhase trackPhase = TR_IDLE;
+static bool trackLocked = false;
+static uint16_t trackDistanceCm = 0;
+static uint16_t savedTrackCm = 0;
+static bool trackGaveUpLogged = false;
+static uint16_t trackSampleCount = 0;
+static uint16_t trackSpreadCm = 0;
+static uint8_t trackFailCount = 0;
+static unsigned long trackPhaseSince = 0;
+static unsigned long trackReadySince = 0;
+static bool trackWaitBResent = false;
+static unsigned long oledDistFocusUntilMs = 0;
+static char trackFailReason[24] = "";
+static char trackRespMac[13] = {0};
+static int trackRespCh = 0;
+static char trackRespKind = 'O';
+
 // ---------- 主机设置菜单（手机式：长按进菜单，加减选择，双击进入）----------
 enum HostSettingsUi : uint8_t {
   HSET_OFF = 0,
@@ -272,6 +293,8 @@ void setupOTA();
 void handleConfigRoot();
 void handleConfigSave();
 void handleStatusPage();
+void handleTrackSave();
+void handleTrackStatus();
 void handleLogPage();
 void handleEspNowInfo();
 void addLog(const String& msg);
@@ -298,6 +321,11 @@ static void flushDelayedCopies(unsigned long now);
 static void bridgeSendA(const uint8_t* data, size_t len);
 static void bridgeSendB(const uint8_t* data, size_t len);
 void hostResetGame();
+static void trackRangeStart();
+static void trackRangeFail(const char* reason);
+static void trackRangeTick(unsigned long now);
+static void trackRangeClear();
+static bool trackParseFtmr(const char* cmd, char macHex[13], int* ch, char* kind);
 void playStartupBeep();
 void buzzerSpeedFeedback();
 void setupOled();
@@ -308,6 +336,10 @@ static bool setupAmpI2s(bool swapBclkLrc);
 void playAmpTestTone(bool swapBclkLrc = false);
 void playBootWelcome();
 static void playPcmMonoS16(const int16_t* pcm, size_t samples, uint16_t srcRate);
+static void ampPlayGroups(const uint8_t* groups, int n);
+static void ampFeed();
+static void ampSpeedFeedback(bool faster, bool atCap);
+static void ampResetFeedback();
 #endif
 
 #if AMP_TEST_ENABLE
@@ -506,6 +538,105 @@ void playBootWelcome() {
   addLog("开机欢迎播放完成");
 #endif
 }
+
+// ---------- 喇叭游戏音效：非阻塞，loop 里 ampFeed 往 I2S 填一小段 ----------
+static const int AMP_QUEUE_MAX = 4;
+struct AmpItem {
+  const int16_t* pcm;
+  size_t samples;
+  uint16_t rate;
+  size_t index;
+  int repsLeft;
+  int16_t cur;
+};
+static AmpItem ampQ[AMP_QUEUE_MAX];
+static uint8_t ampQn = 0;
+static int32_t ampHold[AMP_BUFFER_FRAMES * 2];
+static int ampHoldFrames = 0;
+static int ampHoldOff = 0;
+
+static void ampEnqueueGroup(uint8_t group) {
+  if (group >= AMP_G_COUNT || ampQn >= AMP_QUEUE_MAX) return;
+  uint16_t n = kAmpGroupCount[group];
+  if (n == 0) return;
+  const AmpClipRef& clip = kAmpClips[kAmpGroupBegin[group] + (esp_random() % n)];
+  if (clip.samples == 0) return;
+  if ((size_t)clip.offset + clip.samples * sizeof(int16_t) > (size_t)(game_clips_bin_end - game_clips_bin_start)) {
+    return;
+  }
+  AmpItem& it = ampQ[ampQn++];
+  it.pcm = reinterpret_cast<const int16_t*>(game_clips_bin_start + clip.offset);
+  it.samples = clip.samples;
+  it.rate = clip.rate;
+  it.index = 0;
+  it.repsLeft = 0;
+  it.cur = 0;
+}
+
+static void ampPlayGroups(const uint8_t* groups, int n) {
+  ampQn = 0;
+  ampHoldFrames = 0;
+  ampHoldOff = 0;
+  if (!groups || n <= 0) return;
+  for (int i = 0; i < n; i++) ampEnqueueGroup(groups[i]);
+}
+
+static void ampSpeedFeedback(bool faster, bool atCap) {
+  uint8_t seq[2] = {AMP_G_BEEP, AMP_G_SPEED_SLOW};
+  if (faster && atCap) seq[1] = AMP_G_SPEED_FAST;
+  else if (faster) seq[1] = AMP_G_SPEED_UP;
+  ampPlayGroups(seq, 2);
+}
+
+static void ampResetFeedback() {
+  const uint8_t seq[2] = {AMP_G_BEEP, AMP_G_RESET};
+  ampPlayGroups(seq, 2);
+}
+
+static bool ampFillHold() {
+  ampHoldFrames = 0;
+  ampHoldOff = 0;
+  int nFrames = 0;
+  while (nFrames < AMP_BUFFER_FRAMES && ampQn > 0) {
+    AmpItem& it = ampQ[0];
+    int reps = (it.rate > 0 && it.rate < AMP_SAMPLE_RATE) ? (int)(AMP_SAMPLE_RATE / it.rate) : 1;
+    if (reps < 1) reps = 1;
+    if (it.repsLeft <= 0) {
+      if (it.index >= it.samples) {
+        for (int i = 1; i < ampQn; i++) ampQ[i - 1] = ampQ[i];
+        ampQn--;
+        continue;
+      }
+      it.cur = it.pcm[it.index++];
+      applyAmpVolumeToSample(&it.cur);
+      it.repsLeft = reps;
+    }
+    int32_t s32 = ((int32_t)it.cur) << 16;
+    ampHold[2 * nFrames] = s32;
+    ampHold[2 * nFrames + 1] = s32;
+    nFrames++;
+    it.repsLeft--;
+  }
+  ampHoldFrames = nFrames;
+  return nFrames > 0;
+}
+
+static void ampFeed() {
+  if (ampQn == 0 && ampHoldOff >= ampHoldFrames) return;
+  if (!setupAmpI2s(false)) return;
+  for (int burst = 0; burst < 4; burst++) {
+    if (ampHoldOff >= ampHoldFrames) {
+      if (!ampFillHold()) return;
+    }
+    int left = ampHoldFrames - ampHoldOff;
+    size_t written = 0;
+    esp_err_t err = i2s_write(I2S_PORT_NUM, ampHold + ampHoldOff * 2,
+                              (size_t)left * 2 * sizeof(int32_t), &written, 0);
+    int frames = (int)(written / (2 * sizeof(int32_t)));
+    if (frames > 0) ampHoldOff += frames;
+    if (err != ESP_OK || frames < left) return;
+  }
+}
 #endif
 
 /** 压电片：GPIO 最大驱动 + 多段短鸣（体感更响）；勿长时间直流 */
@@ -596,16 +727,61 @@ static void buzzerUpdate() {
 #endif
 }
 
-/** GameManager 事件 → 音效（保持非阻塞，勿在此 delay） */
+/** GameManager 事件 → 蜂鸣器短音 + 喇叭音效/人声（都不要在这里 delay） */
 static void onGameEvent(GameEvent ev) {
+  uint8_t seq[2];
+  int n = 0;
   switch (ev) {
-    case GameEvent::START: playGameSound(SND_START); addLog("音效：开局上爬音阶"); break;
-    case GameEvent::SHOOT: playGameSound(SND_SHOOT); break;
-    case GameEvent::COLLISION: playGameSound(SND_COLLISION); break;
-    case GameEvent::BAD: playGameSound(SND_BAD); addLog("按错/未交替：BAD 警告音"); break;
-    case GameEvent::WIN: playGameSound(SND_WIN); break;
-    case GameEvent::LOSE: playGameSound(SND_LOSE); break;
+    case GameEvent::START:
+      playGameSound(SND_START);
+      seq[0] = AMP_G_START;
+      n = 1;
+      addLog("音效：开局");
+      break;
+    case GameEvent::SHOOT: {
+      // 每次只播短发射音。鼓励语隔一段时间才说一次
+      static unsigned long cheerAfterMs = 0;
+      seq[0] = AMP_G_SHOT;
+      n = 1;
+      unsigned long nowMs = millis();
+      if (cheerAfterMs == 0) cheerAfterMs = nowMs + 25000UL;
+      else if ((long)(nowMs - cheerAfterMs) >= 0) {
+        seq[1] = AMP_G_CHEER;
+        n = 2;
+        cheerAfterMs = nowMs + 25000UL;
+      }
+      break;
+    }
+    case GameEvent::COLLISION:
+      playGameSound(SND_COLLISION);
+      seq[0] = AMP_G_CLEAR;
+      n = 1;
+      break;
+    case GameEvent::BAD:
+      playGameSound(SND_BAD);
+      seq[0] = AMP_G_WRONG;
+      n = 1;
+      addLog("按错/未交替：BAD");
+      break;
+    case GameEvent::WIN:
+      playGameSound(SND_WIN);
+      seq[0] = AMP_G_WIN_SFX;
+      seq[1] = AMP_G_WIN_VOICE;
+      n = 2;
+      break;
+    case GameEvent::LOSE:
+      playGameSound(SND_LOSE);
+      seq[0] = AMP_G_LOSE_SFX;
+      seq[1] = AMP_G_LOSE_VOICE;
+      n = 2;
+      break;
   }
+#if AMP_TEST_ENABLE
+  if (n > 0) ampPlayGroups(seq, n);
+#else
+  (void)n;
+  (void)seq;
+#endif
 }
 
 static void syncSpawnIntervalFromSpeed() {
@@ -746,12 +922,14 @@ static void oledArmSpeedFocus() {
   if (hostSettingsActive()) return;
   oledSpeedFocusUntilMs = millis() + OLED_SPEED_FOCUS_MS;
   oledVolumeFocusUntilMs = 0;
+  oledDistFocusUntilMs = 0;
 }
 
 static void oledArmVolumeFocus() {
   if (hostSettingsActive()) return;
   oledVolumeFocusUntilMs = millis() + OLED_VOLUME_FOCUS_MS;
   oledSpeedFocusUntilMs = 0;
+  oledDistFocusUntilMs = 0;
 }
 
 static void oledDrawSpeedFocus() {
@@ -804,6 +982,70 @@ static void oledDrawVolumeFocus() {
   u8g2.drawStr((OLED_SCREEN_W - sw) / 2, 62, sub);
 
   u8g2.setDrawColor(1);
+  u8g2.sendBuffer();
+}
+
+static String oledTrackLine() {
+  if (trackLocked && trackDistanceCm > 0) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "AB %u.%02um", trackDistanceCm / 100, trackDistanceCm % 100);
+    return String(buf);
+  }
+  if (trackPhase == TR_WAIT_B || trackPhase == TR_WAIT_A) return "AB 测距中";
+  if (trackPhase == TR_FAIL) return "AB 测距失败";
+  return "AB --";
+}
+
+static void oledDrawDistanceFocus() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+  const char* title = "AB距离";
+  int tw = u8g2.getUTF8Width(title);
+  u8g2.drawUTF8((OLED_SCREEN_W - tw) / 2, 14, title);
+
+  if (trackLocked && trackDistanceCm > 0) {
+    char num[16];
+    snprintf(num, sizeof(num), "%u.%02u", trackDistanceCm / 100, trackDistanceCm % 100);
+    u8g2.setFont(u8g2_font_logisoso24_tr);
+    int nw = u8g2.getStrWidth(num);
+    int nx = (OLED_SCREEN_W - nw) / 2 - 6;
+    if (nx < 0) nx = 0;
+    u8g2.drawStr(nx, 44, num);
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.drawUTF8(nx + nw + 2, 44, "m");
+    char sub[40];
+    snprintf(sub, sizeof(sub), "%u次  差%ucm", trackSampleCount, trackSpreadCm);
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    int sw = u8g2.getUTF8Width(sub);
+    if (sw > OLED_SCREEN_W) sw = OLED_SCREEN_W;
+    u8g2.drawUTF8((OLED_SCREEN_W - sw) / 2, 62, sub);
+  } else {
+    const char* fail = "测距失败";
+    int fw = u8g2.getUTF8Width(fail);
+    u8g2.drawUTF8((OLED_SCREEN_W - fw) / 2, 36, fail);
+    if (trackFailReason[0]) {
+      int rw = u8g2.getUTF8Width(trackFailReason);
+      u8g2.drawUTF8((OLED_SCREEN_W - rw) / 2, 54, trackFailReason);
+    }
+  }
+  u8g2.sendBuffer();
+}
+
+/** 开机先看两边按钮有没有连上；都连上后不再占屏 */
+static void oledDrawLinkStatus() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+  const char* title = "按钮连接";
+  int tw = u8g2.getUTF8Width(title);
+  u8g2.drawUTF8((OLED_SCREEN_W - tw) / 2, 16, title);
+  char lineA[24];
+  char lineB[24];
+  snprintf(lineA, sizeof(lineA), "A  %s", switchAMacValid ? "已连接" : "未连接");
+  snprintf(lineB, sizeof(lineB), "B  %s", switchBMacValid ? "已连接" : "未连接");
+  u8g2.drawUTF8(16, 38, lineA);
+  u8g2.drawUTF8(16, 54, lineB);
   u8g2.sendBuffer();
 }
 
@@ -974,6 +1216,13 @@ static void hostSettingsOnUp() {
     if (gameSpeedLevel < GAME_SPEED_LEVEL_MAX) {
       saveGameSpeedConfig(gameSpeedLevel + 1);
       addLog(String("速度=") + gameSpeedLevel);
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(true, false);
+#endif
+    } else {
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(true, true);
+#endif
     }
   } else if (hostSettingsUi == HSET_WIFI_CONFIRM) {
     hostSettingsWifiYes = 1;
@@ -995,6 +1244,13 @@ static void hostSettingsOnDown() {
     if (gameSpeedLevel > GAME_SPEED_LEVEL_MIN) {
       saveGameSpeedConfig(gameSpeedLevel - 1);
       addLog(String("速度=") + gameSpeedLevel);
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(false, false);
+#endif
+    } else {
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(false, true);
+#endif
     }
   } else if (hostSettingsUi == HSET_WIFI_CONFIRM) {
     hostSettingsWifiYes = 0;
@@ -1022,6 +1278,13 @@ void refreshOledScreen() {
     return;
   }
 
+  // 两边按钮都连上之前，屏幕只显示连接状态
+  if (!(switchAMacValid && switchBMacValid)) {
+    oledDrawLinkStatus();
+    s_inOledRefresh = false;
+    return;
+  }
+
   // 调音量/调速反馈：打断多页轮播
   if (oledVolumeFocusUntilMs != 0 && (long)(millis() - oledVolumeFocusUntilMs) < 0) {
     oledDrawVolumeFocus();
@@ -1035,6 +1298,13 @@ void refreshOledScreen() {
     return;
   }
   oledSpeedFocusUntilMs = 0;
+
+  if (oledDistFocusUntilMs != 0 && (long)(millis() - oledDistFocusUntilMs) < 0) {
+    oledDrawDistanceFocus();
+    s_inOledRefresh = false;
+    return;
+  }
+  oledDistFocusUntilMs = 0;
 
   if (oledSerialMirrorMode) {
     static GameState oledPrevGameState = GameState::IDLE;
@@ -1089,17 +1359,18 @@ void refreshOledScreen() {
       oledStatPageFlipMs = now;
       oledStatPageIdx++;
     }
-    // 首行固定显示联网状态，其余行翻页
-    const int bodyLines = OLED_PAGE_LINES - 1;
+    // 首行联网，第二行固定 AB 距离，其余翻页
+    const int bodyLines = OLED_PAGE_LINES - 2;
     int total = oledBuildStatusLines(oledStatLines, 40);
     int numPages = (total + bodyLines - 1) / bodyLines;
     if (numPages < 1) numPages = 1;
     uint32_t p = oledStatPageIdx % (uint32_t)numPages;
     String pageLines[5];
     pageLines[0] = oledNetStatusLine();
+    pageLines[1] = oledTrackLine();
     for (int i = 0; i < bodyLines; i++) {
       int idx = (int)p * bodyLines + i;
-      pageLines[1 + i] = (idx < total) ? oledStatLines[idx] : "";
+      pageLines[2 + i] = (idx < total) ? oledStatLines[idx] : "";
     }
     oledDrawLinesUtf8(pageLines, OLED_PAGE_LINES);
   }
@@ -1232,6 +1503,8 @@ void setup() {
   Serial.println("输入 'brightness <0-255>' - 设置亮度（例如: brightness 100）");
   Serial.println("输入 'status' - 查看当前状态");
   Serial.println("输入 'vol' / 'vol <20-100>' - 喇叭音量（NVS；也可进设置菜单调）");
+  Serial.println("输入 'track 5.00' - 手填AB距离（米），或 track 500（厘米）");
+  Serial.println("输入 'ftm' - 重新测一次AB距离");
   Serial.println("输入 'debug on/off/debug' - OLED 调试（设置菜单里也可开关）");
   Serial.println("输入 'verbose on/off' - 详细开关日志（设置菜单里也可开关）");
   Serial.println("输入 'espnow on'|'espnow off' - ESP-NOW 收包 hex 调试");
@@ -1259,7 +1532,14 @@ void loadHostConfig() {
   if (spd < GAME_SPEED_LEVEL_MIN) spd = GAME_SPEED_LEVEL_MIN;
   if (spd > GAME_SPEED_LEVEL_MAX) spd = GAME_SPEED_LEVEL_MAX;
   gameSpeedLevel = spd;
+  savedTrackCm = hostPrefs.getUShort("trackcm", 0);
   hostPrefs.end();
+  if (savedTrackCm >= 10 && savedTrackCm <= 5000) {
+    trackDistanceCm = savedTrackCm;
+    trackLocked = true;
+    trackPhase = TR_LOCKED;
+    addLog(String("沿用已保存AB距离 ") + (savedTrackCm / 100) + "." + (savedTrackCm % 100 < 10 ? "0" : "") + (savedTrackCm % 100) + "m");
+  }
   syncSpawnIntervalFromSpeed();
   if (forceOfflineBySwitch) addLog("强制离线:已启用（设置菜单→WiFi配网可关）");
   addLog(String("音量=") + ampVolumePercent + "% 速度=" + gameSpeedLevel + "/" + GAME_SPEED_LEVEL_MAX);
@@ -1339,6 +1619,8 @@ void startConfigAP() {
   configServer.on("/config", handleConfigRoot);
   configServer.on("/save", HTTP_POST, handleConfigSave);
   configServer.on("/status", handleStatusPage);
+  configServer.on("/track", HTTP_POST, handleTrackSave);
+  configServer.on("/track-status", handleTrackStatus);
   configServer.on("/log", handleLogPage);
   configServer.on("/espnow-info", handleEspNowInfo);
   if (!httpServerStarted) {
@@ -1430,6 +1712,8 @@ void setupWiFi() {
     configServer.on("/", handleStatusPage);
     configServer.on("/config", handleConfigRoot);
     configServer.on("/status", handleStatusPage);
+    configServer.on("/track", HTTP_POST, handleTrackSave);
+  configServer.on("/track-status", handleTrackStatus);
     configServer.on("/log", handleLogPage);
     configServer.on("/espnow-info", handleEspNowInfo);
     if (!httpServerStarted) {
@@ -1716,6 +2000,27 @@ void handleStatusPage() {
   page += "<p><b>ESP-NOW 信道</b>：" + String((int)espNowChannel) + "（当前 STA 信道；主机与 A/B 均用 channel=0，同 WiFi 即一致可互通）</p>";
   page += "<p><b>ESP-NOW 收包数</b>：" + String((uint32_t)espNowRecvCount) + "（按 A/B 后刷新，若不变说明主机未收到包）</p>";
   page += "<p><b>最近按下</b>：" + String(lastSwitchPressed == 0 ? "无" : lastSwitchPressed == 'A' ? "开关A" : "开关B") + "</p>";
+  if (trackLocked) {
+    char dist[48];
+    snprintf(dist, sizeof(dist), "%u.%02u m（样本 %u，离散 %u cm）",
+             trackDistanceCm / 100, trackDistanceCm % 100, trackSampleCount, trackSpreadCm);
+    page += "<p><b>AB 距离</b>：<code id='dist'>" + String(dist) + "</code></p>";
+  } else if (trackPhase == TR_WAIT_A || trackPhase == TR_WAIT_B) {
+    page += "<p><b>AB 距离</b>：<span id='dist'>测距中</span></p>";
+  } else if (trackPhase == TR_FAIL) {
+    page += "<p><b>AB 距离</b>：<span id='dist'>测距失败（" + String(trackFailReason) + "）</span></p>";
+  } else {
+    page += "<p><b>AB 距离</b>：<span id='dist'>未填</span></p>";
+  }
+  {
+    char cur[16] = "";
+    if (trackLocked) snprintf(cur, sizeof(cur), "%u.%02u", trackDistanceCm / 100, trackDistanceCm % 100);
+    page += "<form method='POST' action='/track' style='margin:8px 0'>";
+    page += "<label>尺子量 AB（米）：<input name='m' value='" + String(cur) + "' placeholder='5.00' inputmode='decimal' style='width:6em;padding:6px'></label> ";
+    page += "<button type='submit'>保存距离</button></form>";
+    page += "<form method='POST' action='/track' style='margin:0 0 12px'><input type='hidden' name='ftm' value='1'><button type='submit'>再自动测一次</button></form>";
+    page += "<p><small>保存后开机直接用这个距离，不再每次开机测。速度 = 这段距离 ÷ 两边按键的时间。</small></p>";
+  }
   if (currentMode == TEST_GAME) {
     GameState gs = g_game.state();
     page += "<p><b>游戏状态</b>：" + String(hostGameStateLabel(gs)) + "，<b>Dot</b>：" + String(g_game.dotCount()) +
@@ -1747,11 +2052,255 @@ void handleStatusPage() {
       page += escapeHtml(logBuf[j]) + "\n";
     }
     page += "</div><p><small>仅保留最近 " + String(LOG_MAX_LINES) + " 条，每 1 秒自动更新。</small></p>";
-    page += "<script>setInterval(function(){ fetch('log').then(function(r){ return r.text(); }).then(function(t){ var e=document.getElementById('log'); if(e) e.innerText=t; }); }, 1000);</script>";
+    page += "<script>setInterval(function(){ fetch('log').then(function(r){ return r.text(); }).then(function(t){ var e=document.getElementById('log'); if(e) e.innerText=t; }); fetch('track-status').then(function(r){ return r.text(); }).then(function(t){ var d=document.getElementById('dist'); if(d) d.textContent=t; }); }, 1000);</script>";
   }
 
   page += "</body></html>";
   configServer.send(200, "text/html", page);
+}
+
+static bool trackParseFtmr(const char* cmd, char macHex[13], int* ch, char* kind) {
+  if (!cmd || strncmp(cmd, "ftmr,", 5) != 0) return false;
+  const char* s = cmd + 5;
+  if (strlen(s) < 14) return false;
+  for (int i = 0; i < 12; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (!isxdigit(c)) return false;
+    macHex[i] = (char)toupper(c);
+  }
+  macHex[12] = 0;
+  if (s[12] != ',') return false;
+  char* end = nullptr;
+  long channel = strtol(s + 13, &end, 10);
+  if (!end || end == s + 13 || channel < 1 || channel > 13) return false;
+  *ch = (int)channel;
+  *kind = 'O';
+  if (*end == ',' && end[1]) {
+    char k = (char)toupper((unsigned char)end[1]);
+    if (k == 'A' || k == 'O') *kind = k;
+  }
+  return true;
+}
+
+static void trackRangeClear() {
+  trackLocked = false;
+  trackDistanceCm = 0;
+  trackSampleCount = 0;
+  trackSpreadCm = 0;
+  trackFailCount = 0;
+  trackPhase = TR_IDLE;
+  trackReadySince = 0;
+  trackFailReason[0] = 0;
+  oledDistFocusUntilMs = 0;
+  trackGaveUpLogged = false;
+  if (savedTrackCm >= 10 && savedTrackCm <= 5000) {
+    trackDistanceCm = savedTrackCm;
+    trackLocked = true;
+    trackPhase = TR_LOCKED;
+  }
+}
+
+static void trackRangeStart() {
+  if (!switchBMacValid) return;
+  trackPhase = TR_WAIT_B;
+  trackPhaseSince = millis();
+  trackFailReason[0] = 0;
+  trackWaitBResent = false;
+  oledDistFocusUntilMs = 0;
+  sendToSwitchB((const uint8_t*)"FTMB", 4);
+  addLog("开始 AB 测距");
+#if OLED_ENABLE
+  if (oledOk) refreshOledScreen();
+#endif
+}
+
+static void trackRangeFail(const char* reason) {
+  trackPhase = TR_FAIL;
+  trackPhaseSince = millis();
+  trackFailCount++;
+  snprintf(trackFailReason, sizeof(trackFailReason), "%s", reason ? reason : "失败");
+  addLog(String("AB测距失败: ") + trackFailReason);
+  sendToSwitchA((const uint8_t*)"FTMX", 4);
+  sendToSwitchB((const uint8_t*)"FTME", 4);
+  oledSpeedFocusUntilMs = 0;
+  oledVolumeFocusUntilMs = 0;
+  oledDistFocusUntilMs = millis() + 5000UL;
+#if OLED_ENABLE
+  if (oledOk) refreshOledScreen();
+#endif
+}
+
+static void trackRangeAccept(int cm, int samples, int spread) {
+  if (cm < 10 || cm > 5000 || samples < 4) {
+    if (trackPhase == TR_FAIL) return;
+    char why[24];
+    snprintf(why, sizeof(why), "有效样本%d", samples);
+    trackRangeFail(why);
+    return;
+  }
+  trackDistanceCm = (uint16_t)cm;
+  trackSampleCount = (uint16_t)samples;
+  trackSpreadCm = (uint16_t)spread;
+  trackLocked = true;
+  trackPhase = TR_LOCKED;
+  trackFailReason[0] = 0;
+  savedTrackCm = trackDistanceCm;
+  hostPrefs.begin("hostcfg", false);
+  hostPrefs.putUShort("trackcm", trackDistanceCm);
+  hostPrefs.end();
+  sendToSwitchB((const uint8_t*)"FTME", 4);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "AB距离锁定 %u.%02um 样本%u 离散%ucm",
+           trackDistanceCm / 100, trackDistanceCm % 100, trackSampleCount, trackSpreadCm);
+  addLog(buf);
+  oledSpeedFocusUntilMs = 0;
+  oledVolumeFocusUntilMs = 0;
+  oledDistFocusUntilMs = millis() + 8000UL;
+#if OLED_ENABLE
+  if (oledOk) refreshOledScreen();
+#endif
+}
+
+static bool trackLockManual(int cm) {
+  if (cm < 10 || cm > 5000) return false;
+  if (trackPhase == TR_WAIT_A || trackPhase == TR_WAIT_B) {
+    sendToSwitchA((const uint8_t*)"FTMX", 4);
+    sendToSwitchB((const uint8_t*)"FTME", 4);
+  }
+  trackDistanceCm = (uint16_t)cm;
+  trackSampleCount = 0;
+  trackSpreadCm = 0;
+  trackLocked = true;
+  trackPhase = TR_LOCKED;
+  trackFailReason[0] = 0;
+  trackGaveUpLogged = false;
+  savedTrackCm = trackDistanceCm;
+  hostPrefs.begin("hostcfg", false);
+  hostPrefs.putUShort("trackcm", trackDistanceCm);
+  hostPrefs.end();
+  char buf[40];
+  snprintf(buf, sizeof(buf), "手填AB距离 %u.%02um", trackDistanceCm / 100, trackDistanceCm % 100);
+  addLog(buf);
+  oledSpeedFocusUntilMs = 0;
+  oledVolumeFocusUntilMs = 0;
+  oledDistFocusUntilMs = millis() + 8000UL;
+#if OLED_ENABLE
+  if (oledOk) refreshOledScreen();
+#endif
+  return true;
+}
+
+void handleTrackStatus() {
+  char line[96];
+  if (trackPhase == TR_WAIT_B || trackPhase == TR_WAIT_A) {
+    unsigned long sec = (millis() - trackPhaseSince) / 1000UL;
+    snprintf(line, sizeof(line), "测距中，已等 %lu 秒", sec);
+  } else if (trackLocked) {
+    snprintf(line, sizeof(line), "%u.%02u m", trackDistanceCm / 100, trackDistanceCm % 100);
+  } else if (trackPhase == TR_FAIL) {
+    snprintf(line, sizeof(line), "测距失败：%s", trackFailReason);
+  } else {
+    snprintf(line, sizeof(line), "未填");
+  }
+  configServer.send(200, "text/plain; charset=utf-8", line);
+}
+
+void handleTrackSave() {
+  if (configServer.hasArg("ftm")) {
+    processCommand("ftm");
+    configServer.sendHeader("Location", "/");
+    configServer.send(303, "text/plain", "ok");
+    return;
+  }
+  String arg = configServer.arg("m");
+  arg.trim();
+  int cm = 0;
+  if (arg.indexOf('.') >= 0) {
+    cm = (int)(arg.toFloat() * 100.0f + 0.5f);
+  } else {
+    int v = arg.toInt();
+    cm = (v >= 100) ? v : v * 100;
+  }
+  if (!trackLockManual(cm)) {
+    configServer.send(400, "text/plain; charset=utf-8", "距离超出范围，填米数，例如 5.00");
+    return;
+  }
+  configServer.sendHeader("Location", "/");
+  configServer.send(303, "text/plain", "ok");
+}
+
+static void trackRangeTick(unsigned long now) {
+  bool ready = (connectionState == CONN_READY && switchAMacValid && switchBMacValid);
+  bool gameIdle = (currentMode != TEST_GAME) || (g_game.state() == GameState::IDLE);
+
+  if ((trackPhase == TR_WAIT_B || trackPhase == TR_WAIT_A) && (!ready || !gameIdle)) {
+    sendToSwitchA((const uint8_t*)"FTMX", 4);
+    sendToSwitchB((const uint8_t*)"FTME", 4);
+    if (!trackLocked && savedTrackCm >= 10) {
+      trackDistanceCm = savedTrackCm;
+      trackLocked = true;
+      trackPhase = TR_LOCKED;
+      addLog(gameIdle ? "测距中断：开关离线，沿用已保存距离" : "测距中断：游戏已开始，沿用已保存距离");
+    } else {
+      trackPhase = trackLocked ? TR_LOCKED : TR_IDLE;
+      addLog(gameIdle ? "测距中断：开关离线" : "测距中断：游戏已开始");
+    }
+    trackReadySince = 0;
+#if OLED_ENABLE
+    if (oledOk) refreshOledScreen();
+#endif
+    return;
+  }
+  if (!ready || !gameIdle) {
+    if (!ready) trackReadySince = 0;
+    return;
+  }
+
+  if (trackPhase == TR_IDLE && !trackLocked) {
+    if (trackReadySince == 0) trackReadySince = now;
+    if ((unsigned long)(now - trackReadySince) >= 2500UL) {
+      trackRangeStart();
+    }
+    return;
+  }
+
+  if (trackPhase == TR_WAIT_B) {
+    // 第一包可能和开关启动撞上，3 秒后再发一次，不必干等 8 秒
+    if (!trackWaitBResent && (unsigned long)(now - trackPhaseSince) >= 3000UL) {
+      trackWaitBResent = true;
+      sendToSwitchB((const uint8_t*)"FTMB", 4);
+      addLog("重发测距请求给 B");
+    }
+    if ((unsigned long)(now - trackPhaseSince) >= 8000UL) {
+      trackRangeFail("B未开测距");
+    }
+    return;
+  }
+  if (trackPhase == TR_WAIT_A && (unsigned long)(now - trackPhaseSince) >= 40000UL) {
+    trackRangeFail("A测距超时");
+    return;
+  }
+  // 自动只再试一次。对局进行中上面已经 return，不会在跑的时候测。
+  if (trackPhase == TR_FAIL && !trackLocked && trackFailCount < 2 &&
+      (unsigned long)(now - trackPhaseSince) >= 4000UL) {
+    addLog("测距未锁定，再试一次");
+    trackRangeStart();
+    return;
+  }
+  if (trackPhase == TR_FAIL && !trackLocked && trackFailCount >= 2 && !trackGaveUpLogged) {
+    trackGaveUpLogged = true;
+    if (savedTrackCm >= 10) {
+      trackDistanceCm = savedTrackCm;
+      trackLocked = true;
+      trackPhase = TR_LOCKED;
+      addLog("自动测距停止，沿用已保存距离");
+    } else {
+      addLog("自动测距停止。打开主机网页填米数，或点再测一次");
+    }
+#if OLED_ENABLE
+    if (oledOk) refreshOledScreen();
+#endif
+  }
 }
 
 // ESP-NOW 接收回调（与 esp_now.h 中 esp_now_recv_cb_t 一致：mac, data, len）
@@ -1761,9 +2310,9 @@ void onEspNowRecv(const uint8_t* mac, const uint8_t* data, int len) {
   // 回调里立刻刷新在线时间，不等到 loop（对战时 loop 可能忙于 FastLED）
   if (data && len > 0) {
     unsigned long now = millis();
-    if (espNowPayloadIsSwitchA(data, len)) {
+    if (espNowPayloadIsSwitchA(data, len) || (len >= 4 && memcmp(data, "DST,", 4) == 0)) {
       lastReceivedFromA = now;
-    } else if (espNowPayloadIsSwitchB(data, len)) {
+    } else if (espNowPayloadIsSwitchB(data, len) || (len >= 5 && memcmp(data, "FTMR,", 5) == 0)) {
       lastReceivedFromB = now;
     }
   }
@@ -1798,8 +2347,11 @@ void loop() {
   // 处理 OTA
   ArduinoOTA.handle();
 
-  // 蜂鸣器音效序列推进（无阻塞）
+  // 蜂鸣器音效序列推进（无阻塞）；喇叭音效同一轮往 I2S 填一段
   buzzerUpdate();
+#if AMP_TEST_ENABLE
+  ampFeed();
+#endif
 
   // 配网/状态页（AP 或 STA 连上时）
   if (wifiApMode || wifiConnected) {
@@ -1911,12 +2463,18 @@ void loop() {
       saveGameSpeedConfig(gameSpeedLevel + 1);
       addLog("加速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（已保存）");
       buzzerSpeedFeedback();
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(true, false);
+#endif
 #if OLED_ENABLE
       oledArmSpeedFocus();
       refreshOledScreen();
 #endif
     } else {
       addLog("加速：已达最快 " + String(GAME_SPEED_LEVEL_MAX));
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(true, true);
+#endif
 #if OLED_ENABLE
       oledArmSpeedFocus();
       refreshOledScreen();
@@ -1932,12 +2490,18 @@ void loop() {
       saveGameSpeedConfig(gameSpeedLevel - 1);
       addLog("减速：速度=" + String(gameSpeedLevel) + "/" + String(GAME_SPEED_LEVEL_MAX) + "（已保存）");
       buzzerSpeedFeedback();
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(false, false);
+#endif
 #if OLED_ENABLE
       oledArmSpeedFocus();
       refreshOledScreen();
 #endif
     } else {
       addLog("减速：已达最慢 " + String(GAME_SPEED_LEVEL_MIN));
+#if AMP_TEST_ENABLE
+      ampSpeedFeedback(false, true);
+#endif
 #if OLED_ENABLE
       oledArmSpeedFocus();
       refreshOledScreen();
@@ -1993,9 +2557,29 @@ void loop() {
       bool isAHeartbeatOnly = cmd.equalsIgnoreCase("pa");
       bool isBHeartbeatOnly = cmd.equalsIgnoreCase("pb");
       if (isA) {
+        bool wasA = switchAMacValid;
+        bool wasBoth = switchAMacValid && switchBMacValid;
         lastReceivedFromA = currentTime;
         memcpy(switchAMac, lastSenderMac, 6);
         switchAMacValid = true;
+        if (!wasA) {
+          addLog("按钮A 已连接");
+#if AMP_TEST_ENABLE
+          ampEnqueueGroup(AMP_G_ONLINE_A);
+#endif
+#if OLED_ENABLE
+          if (oledOk) refreshOledScreen();
+#endif
+        }
+        if (!wasBoth && switchBMacValid) {
+          addLog("按钮两边已连接");
+#if AMP_TEST_ENABLE
+          ampEnqueueGroup(AMP_G_READY);
+#endif
+#if OLED_ENABLE
+          if (oledOk) refreshOledScreen();
+#endif
+        }
         esp_now_peer_info_t peer = {};
         memcpy(peer.peer_addr, lastSenderMac, 6);
         peer.channel = espNowPeerChannel;
@@ -2014,9 +2598,29 @@ void loop() {
           connReadyLatched = true;
         }
       } else if (isB) {
+        bool wasB = switchBMacValid;
+        bool wasBoth = switchAMacValid && switchBMacValid;
         lastReceivedFromB = currentTime;
         memcpy(switchBMac, lastSenderMac, 6);
         switchBMacValid = true;
+        if (!wasB) {
+          addLog("按钮B 已连接");
+#if AMP_TEST_ENABLE
+          ampEnqueueGroup(AMP_G_ONLINE_B);
+#endif
+#if OLED_ENABLE
+          if (oledOk) refreshOledScreen();
+#endif
+        }
+        if (!wasBoth && switchAMacValid) {
+          addLog("按钮两边已连接");
+#if AMP_TEST_ENABLE
+          ampEnqueueGroup(AMP_G_READY);
+#endif
+#if OLED_ENABLE
+          if (oledOk) refreshOledScreen();
+#endif
+        }
         addLogVerbose("已识别为 B，设置开关 B 为已发现");
         esp_now_peer_info_t peer = {};
         memcpy(peer.peer_addr, lastSenderMac, 6);
@@ -2090,6 +2694,7 @@ void loop() {
           lastReceivedFromA = 0;
           lastReceivedFromB = 0;
           g_game.forceIdle();
+          trackRangeClear();
           addLog("双开关长期离线，回到搜索 A/B");
         }
       } else {
@@ -2139,6 +2744,8 @@ void loop() {
     FastLED.show();
     lastUpdate = currentTime;
   }
+
+  trackRangeTick(currentTime);
 
 #if OLED_ENABLE
   // OLED 放在刷灯之后：全缓冲 I2C 很慢，对战时拉长间隔，避免整条灯带像被刷新了一下
@@ -2214,6 +2821,58 @@ void processCommand(String cmd) {
                          switchBMacValid, bridgeSendA, bridgeSendB);
   } else if (cmd == "pa" || cmd == "pb") {
     // 心跳：仅用于在线检测，不触发游戏逻辑
+  } else if (cmd.startsWith("ftmr,")) {
+    char mac[13];
+    int ch = 0;
+    char kind = 'O';
+    if (trackPhase == TR_WAIT_B && trackParseFtmr(cmd.c_str(), mac, &ch, &kind)) {
+      snprintf(trackRespMac, sizeof(trackRespMac), "%s", mac);
+      trackRespCh = ch;
+      trackRespKind = kind;
+      char out[40];
+      snprintf(out, sizeof(out), "FTMA,%s,%d,%c", mac, ch, kind);
+      sendToSwitchA((const uint8_t*)out, strlen(out));
+      trackPhase = TR_WAIT_A;
+      trackPhaseSince = millis();
+      addLog(String("B已应答，让A测距 ch=") + ch);
+#if OLED_ENABLE
+      if (oledOk) refreshOledScreen();
+#endif
+    }
+  } else if (cmd.startsWith("dst,")) {
+    int cm = 0, samples = 0, spread = 0;
+    sscanf(cmd.c_str(), "dst,%d,%d,%d", &cm, &samples, &spread);
+    if (trackPhase == TR_WAIT_A || trackPhase == TR_WAIT_B || trackPhase == TR_FAIL || trackPhase == TR_IDLE) {
+      if (!trackLocked) trackRangeAccept(cm, samples, spread);
+    }
+  } else if (cmd == "ftm") {
+    if (trackPhase == TR_WAIT_A || trackPhase == TR_WAIT_B) {
+      addLog("测距还在进行，等这一轮结束");
+    } else {
+    trackLocked = false;
+    trackDistanceCm = 0;
+    trackSampleCount = 0;
+    trackSpreadCm = 0;
+    trackFailCount = 0;
+    trackFailReason[0] = 0;
+    trackGaveUpLogged = false;
+    trackPhase = TR_IDLE;
+    addLog("手动重新测距");
+    trackRangeStart();
+    }
+  } else if (cmd.startsWith("track ")) {
+    String arg = cmd.substring(6);
+    arg.trim();
+    int cm = 0;
+    if (arg.indexOf('.') >= 0) {
+      cm = (int)(arg.toFloat() * 100.0f + 0.5f);
+    } else {
+      int v = arg.toInt();
+      cm = (v >= 100) ? v : v * 100;
+    }
+    if (!trackLockManual(cm)) {
+      Serial.println("距离超出范围，例: track 5.00（米）或 track 500（厘米）");
+    }
   } else if (cmd.startsWith("brightness ")) {
     int brightness = cmd.substring(11).toInt();
     if (brightness >= 0 && brightness <= 255) {
@@ -2304,6 +2963,16 @@ void processCommand(String cmd) {
     printCurrentMode();
     Serial.print("最近按下: ");
     Serial.println(lastSwitchPressed == 0 ? "无" : lastSwitchPressed == 'A' ? "开关A" : "开关B");
+    if (trackLocked) {
+      Serial.printf("AB距离: %u.%02u m（样本%u，离散%u cm）\n",
+                    trackDistanceCm / 100, trackDistanceCm % 100, trackSampleCount, trackSpreadCm);
+    } else if (trackPhase == TR_WAIT_A || trackPhase == TR_WAIT_B) {
+      Serial.println("AB距离: 测距中");
+    } else if (trackPhase == TR_FAIL) {
+      Serial.printf("AB距离: 测距失败（%s）串口 ftm 重测\n", trackFailReason);
+    } else {
+      Serial.println("AB距离: 未测");
+    }
     if (WiFi.status() == WL_CONNECTED) {
       Serial.print("WiFi IP: ");
       Serial.println(WiFi.localIP());
@@ -2311,7 +2980,7 @@ void processCommand(String cmd) {
       Serial.println("WiFi: 未连接");
     }
   } else {
-    Serial.println("未知命令。可用: 1,2,3,A,B, brightness, vol, status, debug, verbose on/off, espnow on/off, amp");
+    Serial.println("未知命令。可用: 1,2,3,A,B, brightness, vol, status, debug, verbose on/off, espnow on/off, amp, ftm");
   }
 }
 
@@ -2418,7 +3087,7 @@ void testGame() {
 /** 关键指令多连发抗丢包：首包立刻发，后续拷贝按 25ms 排队，不再 delay 堵灯带 */
 #define DELAYED_COPY_SLOTS 8
 #define DELAYED_COPY_GAP_MS 25UL
-#define DELAYED_COPY_MAX_LEN 16
+#define DELAYED_COPY_MAX_LEN 32
 struct DelayedCopy {
   uint8_t mac[6];
   uint8_t data[DELAYED_COPY_MAX_LEN];
@@ -2469,6 +3138,9 @@ void hostResetGame() {
   addLog("主机 SET：游戏已重置回待机");
 #if BUZZER_ENABLE
   buzzerSpeedFeedback();
+#endif
+#if AMP_TEST_ENABLE
+  ampResetFeedback();
 #endif
 #if OLED_ENABLE
   if (oledOk) refreshOledScreen();
